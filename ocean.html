@@ -63,6 +63,17 @@ struct Frame {
 };
 `;
 
+// Per-frame lighting constants, written once per frame by the sun-visibility pass (after the
+// env cube update) so the ocean shader reads them instead of re-deriving them per pixel.
+const LIGHT_WGSL = /* wgsl */ `
+struct Light {
+  sunVis:  vec4f,   // x = cloud transmittance towards the sun
+  sunE:    vec4f,   // rgb = sun illuminance at the camera * sunVis
+  skyUp:   vec4f,   // rgb = env cube zenith radiance (coarsest mip)
+  skyHemi: vec4f,   // rgb = average upper-hemisphere radiance
+};
+`;
+
 const ATMO_CORE_WGSL = /* wgsl */ `
 const PI: f32 = 3.14159265358979;
 const RG: f32 = 6360.0;
@@ -428,7 +439,8 @@ fn emit(x: u32, y: u32, c: u32, a: vec4f, b: vec4f) {
   let p = vec2u(x, y);
   textureStore(dispOut, p, c, vec4f(a.x, a.z, a.y, a.w));
   textureStore(derivOut, p, c, b);
-  textureStore(momOut, p, c, vec4f(b.x * b.x, b.y * b.y, b.x * b.y, 0.0));
+  // slope moments plus a copy of jxz, so the ocean shader needs no dispTex fetch
+  textureStore(momOut, p, c, vec4f(b.x * b.x, b.y * b.y, b.x * b.y, a.w));
 }
 
 @compute @workgroup_size(${N / 2})
@@ -863,6 +875,8 @@ fn cloudFbm(p: vec2f, fp: f32, oct: i32, billow: f32) -> f32 {
   for (var i = 0; i < oct; i++) {
     // fade octaves well before they reach pixel size (half-res buffer) -> no shimmer in motion
     let w = 1.0 - smoothstep(0.08, 0.28, fp * f);
+    // the weight only falls as f grows: once an octave is fully faded, so are all the rest
+    if (w <= 0.0) { break; }
     var n = gnoise(q);
     if (i >= 2) { n = mix(n, abs(n) * 2.0 - 0.38, billow); }
     s += a * n * w;
@@ -941,6 +955,11 @@ fn shadeLayer(dir: vec3f, h: CloudHit, hc: f32, d: f32, s1: f32, s2: f32, s3: f3
 // aa: per-layer edge change per pixel (fwidth of the edge function); negative = estimate it
 // from the pixel footprint (compute passes, which have no derivatives)
 fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> vec4f {
+  return cloudLayersE(dir, pixAng, aa, vec2f(0.0), false, sunT);
+}
+// haveE: edges holds the layers' edge values at this pixel (low, high), already evaluated by
+// the caller with the same hit and footprint, so they are not computed a second time
+fn cloudLayersE(dir: vec3f, pixAng: f32, aa: vec2f, edges: vec2f, haveE: bool, sunT: ptr<function, f32>) -> vec4f {
   *sunT = 1.0;
   if (dir.y <= 0.0) { return vec4f(0.0); }
   let sxz = F.sunDir.xz / max(length(F.sunDir.xz), 1e-4);
@@ -953,7 +972,8 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
     let far = 1.0 - smoothstep(18.0, 36.0, h.t);
     if (far > 0.0) {
       let fp = h.t * pixAng / h.mu;
-      let e = lowEdge(h.q, fp, 7);
+      var e = edges.x;
+      if (!haveE) { e = lowEdge(h.q, fp, 7); }
       let d = clamp(e / lowSoft(fp), 0.0, 1.0) * far;
       if (d > 0.002) {
         let s1 = lowDensity(h.q + sxz * 0.08, fp, 5) * far;
@@ -976,7 +996,8 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
     let far = 1.0 - smoothstep(30.0, 70.0, h.t);
     if (far > 0.0) {
       let fp = h.t * pixAng / h.mu;
-      let e = highEdge(h.q, fp, 6);
+      var e = edges.y;
+      if (!haveE) { e = highEdge(h.q, fp, 6); }
       let d = clamp(e / highSoft(fp), 0.0, 1.0) * far;
       if (d > 0.002) {
         let s1 = highDensity(h.q + sxz * 0.15, fp, 4) * far;
@@ -1061,13 +1082,18 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 }
 `;
 
-const CUBE_MIPS = /* wgsl */ `
+// Mips are rebuilt only for the faces the env pass refreshed this frame (dispatch z = their
+// count): face = (frame + z) % 6, the same rotation as ENV_CUBE. Each face's mips depend only
+// on that face, so the others are already up to date.
+const CUBE_MIPS = FRAME_WGSL + /* wgsl */ `
 @group(0) @binding(0) var src: texture_2d_array<f32>;
 @group(0) @binding(1) var dst: texture_storage_2d_array<rgba16float, write>;
+@group(0) @binding(2) var<uniform> F: Frame;
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3u) {
   let size = textureDimensions(dst);
   if (id.x >= size.x || id.y >= size.y) { return; }
+  let face = (u32(F.post.z) + id.z) % 6u;
   let srcSize = vec2i(textureDimensions(src));
   let p = vec2i(id.xy) * 2;
   // 4x4 tent-ish filter for smoother roughness blur
@@ -1077,23 +1103,26 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     for (var i = -1; i <= 2; i++) {
       let q = clamp(p + vec2i(i, j), vec2i(0), srcSize - 1);
       let w = select(1.0, 3.0, i == 0 || i == 1) * select(1.0, 3.0, j == 0 || j == 1);
-      acc += textureLoad(src, q, id.z, 0) * w;
+      acc += textureLoad(src, q, face, 0) * w;
       wsum += w;
     }
   }
-  textureStore(dst, id.xy, id.z, acc / wsum);
+  textureStore(dst, id.xy, face, acc / wsum);
 }
 `;
 
 // Cloud transmittance towards the sun (averaged over the solar disc), used to dim
-// direct sunlight on the water when the sun is behind clouds.
-const SUN_VIS = FRAME_WGSL + ATMO_CORE_WGSL + /* wgsl */ `
+// direct sunlight on the water when the sun is behind clouds. Runs after the env cube update
+// and also stores the frame's lighting constants for the ocean shader (Light).
+const SUN_VIS = FRAME_WGSL + ATMO_CORE_WGSL + LIGHT_WGSL + /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var transLUT: texture_2d<f32>;
 @group(0) @binding(2) var skyLUT: texture_2d<f32>;
 @group(0) @binding(3) var sampC: sampler;
-@group(0) @binding(4) var<storage, read_write> sunVis: array<f32, 4>;
+@group(0) @binding(4) var<storage, read_write> light: Light;
+@group(0) @binding(5) var envCube: texture_cube<f32>;
 ` + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + /* wgsl */ `
+const ENV_MAXMIP: f32 = ${ENV_MIPS - 1}.0;
 var<workgroup> part: array<f32, 8>;
 // one ray per thread (7 rays across the disc), then a tiny reduction
 @compute @workgroup_size(8)
@@ -1113,7 +1142,17 @@ fn main(@builtin(local_invocation_index) k: u32) {
   if (k == 0u) {
     var acc = 0.0;
     for (var i = 0u; i < 7u; i++) { acc += part[i]; }
-    sunVis[0] = acc / 7.0;
+    let vis = acc / 7.0;
+    light.sunVis = vec4f(vis, 0.0, 0.0, 0.0);
+    light.sunE = vec4f(sunIlluminance() * vis, 0.0);
+    let skyUp = textureSampleLevel(envCube, sampC, vec3f(0.0, 1.0, 0.0), ENV_MAXMIP).rgb;
+    light.skyUp = vec4f(skyUp, 0.0);
+    // average radiance of the whole upper hemisphere (incl. the bright horizon band)
+    light.skyHemi = vec4f(skyUp * 0.4 + 0.15 * (
+        textureSampleLevel(envCube, sampC, vec3f(0.94, 0.34, 0.0), ENV_MAXMIP - 1.0).rgb +
+        textureSampleLevel(envCube, sampC, vec3f(-0.94, 0.34, 0.0), ENV_MAXMIP - 1.0).rgb +
+        textureSampleLevel(envCube, sampC, vec3f(0.0, 0.34, 0.94), ENV_MAXMIP - 1.0).rgb +
+        textureSampleLevel(envCube, sampC, vec3f(0.0, 0.34, -0.94), ENV_MAXMIP - 1.0).rgb), 0.0);
   }
 }
 `;
@@ -1153,13 +1192,18 @@ struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
   let eh = highEdge(hh.q, hh.t * pixAng / hh.mu, 6);
   let aa = vec2f(fwidth(el), fwidth(eh));
   var sunT = 1.0;
-  let cl = cloudLayers(d2, pixAng, aa, &sunT);
+  // reuse the edge values: cloudLayers would evaluate the same two noise stacks again
+  let cl = cloudLayersE(d2, pixAng, aa, vec2f(el, eh), true, &sunT);
   let L = skyAtmo(d2) * (1.0 - cl.a) + cl.rgb + sunDisk(dir) * sunT;
   return vec4f(L, 1.0);
 }
 `;
 
-const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ `
+// The surface is drawn twice: a depth-only pass (fsDepth) and then the shading pass with
+// depthCompare 'equal', so the expensive fragment shader runs only for the front-most surface
+// instead of for every wave face hidden behind a nearer crest. @invariant keeps the depth of
+// both passes identical.
+const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + LIGHT_WGSL + RENDER_BINDINGS + /* wgsl */ `
 @group(0) @binding(4) var dispTex: texture_2d_array<f32>;
 @group(0) @binding(5) var derivTex: texture_2d_array<f32>;
 @group(0) @binding(6) var momTex: texture_2d_array<f32>;
@@ -1167,14 +1211,14 @@ const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ `
 @group(0) @binding(8) var envCube: texture_cube<f32>;
 @group(0) @binding(9) var sampR: sampler;
 @group(0) @binding(10) var foamWorld: texture_2d_array<f32>;
-@group(0) @binding(11) var<storage, read> sunVis: array<f32, 4>;
+@group(0) @binding(11) var<storage, read> light: Light;
 ` + SKY_RENDER_FUNCS + /* wgsl */ `
 const ENV_MAXMIP: f32 = ${ENV_MIPS - 1}.0;
 const ENV_TEXELS_PER_RAD: f32 = ${ENV_SIZE}.0 / 1.5708;
 const TEX_N: f32 = ${N}.0;
 
 struct VSOut {
-  @builtin(position) pos: vec4f,
+  @builtin(position) @invariant pos: vec4f,
   @location(0) rel: vec3f,     // displaced position relative to the camera
   @location(1) xz: vec2f,      // undisplaced (lagrangian) coordinates
   @location(2) height: f32,
@@ -1226,6 +1270,16 @@ fn lambdaSmith(w: vec3f, cov: vec3f) -> f32 {
   return (1.0 - 1.259 * a + 0.396 * a * a) / (3.535 * a + 2.181 * a * a);
 }
 
+// true when the condition holds anywhere in this pixel's 2x2 quad (helper lanes included);
+// built from fine derivatives, so it must be called in uniform control flow
+fn quadAny(c: bool) -> bool {
+  let v = select(0.0, 1.0, c);
+  let h = v + abs(dpdxFine(v));
+  return h + abs(dpdyFine(h)) > 0.0;
+}
+
+// only called from a quad-uniform branch (see quadAny), where implicit derivatives are valid
+@diagnostic(off, derivative_uniformity)
 fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let a = textureSample(foamTex, sampR, xz * 0.23 + vec2f(0.013, 0.0) * t).r;
   let b = textureSample(foamTex, sampR, xz * 0.71 + vec2f(0.37, 0.71)).g;
@@ -1246,12 +1300,13 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
     let uv = xz * F.cascInvL[c >> 2u][c & 3u];
     let gk = mix(1.0, gust, select(0.0, select(0.5, 1.0, c >= 4u), c >= 3u));
     let dv = textureSample(derivTex, sampR, uv, c) * gk;
-    let mv = textureSample(momTex, sampR, uv, c) * (gk * gk);
-    let av = textureSample(dispTex, sampR, uv, c) * gk;
+    // momTex.w carries the jxz Jacobian term (also in dispTex.w), saving a fetch per cascade
+    let m = textureSample(momTex, sampR, uv, c);
+    let mv = m * (gk * gk);
     s += dv.xy;
     jxx += dv.z;
     jzz += dv.w;
-    jxz += av.w;
+    jxz += m.w * gk;
     cov += vec3f(max(mv.x - dv.x * dv.x, 0.0), max(mv.y - dv.y * dv.y, 0.0), mv.z - dv.x * dv.y);
   }
   let dist = length(in.rel);
@@ -1274,14 +1329,10 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   cov += aa * min(1.0, 0.03 / max(max(aa.x, aa.y), 1e-8));
   let J = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
 
-  let sunE = sunIlluminance() * sunVis[0];
-  let skyUp = textureSampleLevel(envCube, sampC, vec3f(0.0, 1.0, 0.0), ENV_MAXMIP).rgb;
-  // average radiance of the whole upper hemisphere (incl. the bright horizon band)
-  let skyHemi = skyUp * 0.4 + 0.15 * (
-      textureSampleLevel(envCube, sampC, vec3f(0.94, 0.34, 0.0), ENV_MAXMIP - 1.0).rgb +
-      textureSampleLevel(envCube, sampC, vec3f(-0.94, 0.34, 0.0), ENV_MAXMIP - 1.0).rgb +
-      textureSampleLevel(envCube, sampC, vec3f(0.0, 0.34, 0.94), ENV_MAXMIP - 1.0).rgb +
-      textureSampleLevel(envCube, sampC, vec3f(0.0, 0.34, -0.94), ENV_MAXMIP - 1.0).rgb);
+  // frame constants (see SUN_VIS): sun illuminance, zenith sky, upper-hemisphere average
+  let sunE = light.sunE.rgb;
+  let skyUp = light.skyUp.rgb;
+  let skyHemi = light.skyHemi.rgb;
   let skyN = textureSampleLevel(envCube, sampC, nrm, ENV_MAXMIP - 1.0).rgb;
 
   // ---- sun glitter: anisotropic Gaussian slope distribution ----
@@ -1336,38 +1387,53 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let cheb = max(dc.x, dc.y);
   let w0 = 1.0 - smoothstep(0.30 * F.lodP.z, 0.45 * F.lodP.z, cheb);
   let w1 = 1.0 - smoothstep(0.30 * F.lodP.w, 0.45 * F.lodP.w, cheb);
-  let fw0 = textureSample(foamWorld, sampR, xz / F.lodP.z, 0u);
-  let fw1 = textureSample(foamWorld, sampR, xz / F.lodP.w, 1u);
+  // Texture work that cannot change this pixel is skipped, but only for whole 2x2 quads
+  // (quadAny), so the implicit derivatives of every fetch that does run are unchanged. A
+  // clipmap level with weight 0 contributes exactly 0, as does the foam pattern where there
+  // is no cover and no fresh crest foam, so the result is the same as always fetching.
+  let dbg = F.post.w > 0.5;
+  var fw0 = vec4f(0.0);
+  var fw1 = vec4f(0.0);
+  @diagnostic(off, derivative_uniformity) if (quadAny(w0 > 0.0 || dbg)) {
+    fw0 = textureSample(foamWorld, sampR, xz / F.lodP.z, 0u);
+  }
+  @diagnostic(off, derivative_uniformity) if (quadAny(w1 > 0.0 || dbg)) {
+    fw1 = textureSample(foamWorld, sampR, xz / F.lodP.w, 1u);
+  }
   let fwl = mix(fw1, fw0, w0) * w1;
   let fresh = clamp((F.foamP.x - J) * F.foamP.y, 0.0, 1.0);
   var cover = clamp((max(fwl.r, fresh * (1.0 - w1 * 0.7)) + fwl.g * 0.6) * F.foamP.z, 0.0, 1.5);
-  // aged foam breaks into wind-aligned streaks; fresh crest foam stays dense
-  let wd = F.windP[0].xy;
-  let ws = vec2f(dot(xz, wd), dot(xz, vec2f(-wd.y, wd.x)));
-  let streak = textureSample(foamTex, sampR, ws * vec2f(0.035, 0.11)).a;
-  let freshK = clamp(fwl.g * 2.0 + fresh, 0.0, 1.0);
-  cover *= mix(smoothstep(0.25, 0.75, streak) * 1.5, 1.0, freshK);
-  let pat = foamPattern(xz, F.camPos.w);
-  let fw = fwidth(pat) + 0.03;
-  // soft threshold: thin foam is a translucent film, dense foam is opaque white
-  // dense foam has crisp edges, thin decaying foam a soft translucent margin
-  let soft = 0.04 + 0.14 * (1.0 - clamp(cover, 0.0, 1.0));
-  let fm = smoothstep(1.0 - cover - fw - soft, 1.0 - cover + fw + soft, pat);
-  var foamMask = clamp(fm * smoothstep(0.0, 0.5, cover), 0.0, 1.0) * (0.68 + 0.32 * smoothstep(0.3, 0.9, cover));
-  // freshly broken crests: dense, almost opaque core
-  foamMask = max(foamMask, smoothstep(0.35, 0.9, fwl.g) * smoothstep(0.25, 0.6, pat + 0.25) * 0.95);
+  var foamMask = 0.0;
+  var foamLit = vec3f(0.0);
+  @diagnostic(off, derivative_uniformity) if (quadAny(cover > 0.0 || fwl.g > 0.35 || dbg)) {
+    // aged foam breaks into wind-aligned streaks; fresh crest foam stays dense
+    let wd = F.windP[0].xy;
+    let ws = vec2f(dot(xz, wd), dot(xz, vec2f(-wd.y, wd.x)));
+    let streak = textureSample(foamTex, sampR, ws * vec2f(0.035, 0.11)).a;
+    let freshK = clamp(fwl.g * 2.0 + fresh, 0.0, 1.0);
+    cover *= mix(smoothstep(0.25, 0.75, streak) * 1.5, 1.0, freshK);
+    let pat = foamPattern(xz, F.camPos.w);
+    let fw = fwidth(pat) + 0.03;
+    // soft threshold: thin foam is a translucent film, dense foam is opaque white
+    // dense foam has crisp edges, thin decaying foam a soft translucent margin
+    let soft = 0.04 + 0.14 * (1.0 - clamp(cover, 0.0, 1.0));
+    let fm = smoothstep(1.0 - cover - fw - soft, 1.0 - cover + fw + soft, pat);
+    foamMask = clamp(fm * smoothstep(0.0, 0.5, cover), 0.0, 1.0) * (0.68 + 0.32 * smoothstep(0.3, 0.9, cover));
+    // freshly broken crests: dense, almost opaque core
+    foamMask = max(foamMask, smoothstep(0.35, 0.9, fwl.g) * smoothstep(0.25, 0.6, pat + 0.25) * 0.95);
+    // bubbly brightness variation inside the foam
+    let bub = textureSample(foamTex, sampR, xz * 1.9 + vec2f(0.21, 0.53)).g;
+    let foamAlb = vec3f(0.82, 0.87, 0.92) * (0.78 + 0.3 * bub);
+    // diffuse: albedo * (sky irradiance / pi + sun * cos / pi); sky dominates at sunset
+    // foam scatters light from the whole hemisphere (incl. the cool zenith): use a less saturated ambient
+    let foamAmb = skyHemi * 1.0 + skyN * 0.3;
+    let foamAmbN = mix(foamAmb, vec3f(dot(foamAmb, vec3f(0.2126, 0.7152, 0.0722))), 0.85);
+    // grazing sun is largely self-shadowed by the foam's lumpy micro-structure
+    foamLit = foamAlb * (sunE * max(dot(nrm, Ld), 0.0) * 0.318 * 0.5 + foamAmbN * 1.55);
+  }
   // submerged bubbles brighten and tint the water just beneath foam
   body += F.sssCol.rgb * (sunE * 0.05 + ambient * 0.35) * clamp(cover, 0.0, 1.0);
   body += vec3f(0.10, 0.32, 0.30) * skyUp * fwl.g * 0.35;
-  // bubbly brightness variation inside the foam
-  let bub = textureSample(foamTex, sampR, xz * 1.9 + vec2f(0.21, 0.53)).g;
-  let foamAlb = vec3f(0.82, 0.87, 0.92) * (0.78 + 0.3 * bub);
-  // diffuse: albedo * (sky irradiance / pi + sun * cos / pi); sky dominates at sunset
-  // foam scatters light from the whole hemisphere (incl. the cool zenith): use a less saturated ambient
-  let foamAmb = skyHemi * 1.0 + skyN * 0.3;
-  let foamAmbN = mix(foamAmb, vec3f(dot(foamAmb, vec3f(0.2126, 0.7152, 0.0722))), 0.85);
-  // grazing sun is largely self-shadowed by the foam's lumpy micro-structure
-  let foamLit = foamAlb * (sunE * max(dot(nrm, Ld), 0.0) * 0.318 * 0.5 + foamAmbN * 1.55);
 
   if (F.post.w > 0.5) {
     // debug: r = foam cover, g = clamp(J), b = world foam level-0 weight
@@ -1390,6 +1456,9 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   col = col * T + fogCol * (1.0 - T);
   return vec4f(col, 1.0);
 }
+
+// depth pre-pass: no colour output (the pipeline's colour writeMask is 0)
+@fragment fn fsDepth() {}
 `;
 
 // Samples the displaced surface height under the camera (inverting the horizontal
@@ -1620,8 +1689,11 @@ async function main() {
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) fail('No WebGPU adapter found.');
   const hasTS = adapter.features.has('timestamp-query');
+  // a stencil plane lets the ocean shading pass keep the first of two triangles at exactly
+  // the same depth, as a single depth-tested pass does (see oceanPipe)
+  const hasDS8 = adapter.features.has('depth32float-stencil8');
   const device = await adapter.requestDevice({
-    requiredFeatures: hasTS ? ['timestamp-query'] : [],
+    requiredFeatures: [...(hasTS ? ['timestamp-query'] : []), ...(hasDS8 ? ['depth32float-stencil8'] : [])],
   });
   device.lost.then((i) => log('device lost: ' + i.message));
   device.onuncapturederror = (e) => log('GPU error: ' + e.error.message);
@@ -1695,7 +1767,8 @@ async function main() {
 
   const bg = (pipe, entries, label) => device.createBindGroup({
     label, layout: pipe.getBindGroupLayout(0),
-    entries: entries.map((r, i) => ({ binding: i, resource: r })),
+    // entry i is binding i; null skips a binding the pipeline's shaders do not use
+    entries: entries.map((r, i) => ({ binding: i, resource: r })).filter((e) => e.resource),
   });
   const bgInit = bg(initPipe, [{ buffer: simUBO }, { buffer: h0Buf }], 'init');
   const bgEvolve = bg(evolvePipe, [{ buffer: simUBO }, { buffer: h0Buf }, { buffer: specA }, { buffer: specB }], 'evolve');
@@ -1779,7 +1852,7 @@ async function main() {
     addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 16,
   });
   const frameUBO = mkBuf(384, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
-  const sunVisBuf = mkBuf(16, GU.STORAGE, 'sun visibility');
+  const lightBuf = mkBuf(64, GU.STORAGE, 'light');  // Light struct (see common.js)
   const transView = transLUT.createView();
   const msView = msLUT.createView();
   const skyView = skyLUT.createView();
@@ -1788,15 +1861,20 @@ async function main() {
   const bgMS = bg(msPipe, [{ buffer: atmoUBO }, transView, sampClamp, msView], 'ms');
   const bgSkyView = bg(skyViewPipe, [{ buffer: frameUBO }, transView, msView, sampClamp, skyView], 'skyview');
   const bgEnv = bg(envPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, lvl(envTex, 0)], 'env');
-  const bgSunVis = bg(sunVisPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, { buffer: sunVisBuf }], 'sunvis');
+  const bgSunVis = bg(sunVisPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, { buffer: lightBuf }, envCubeView], 'sunvis');
   const bgCubeMips = [];
-  for (let m = 1; m < ENV_MIPS; m++) bgCubeMips.push(bg(cubeMipPipe, [lvl(envTex, m - 1), lvl(envTex, m)], 'cubemip' + m));
+  for (let m = 1; m < ENV_MIPS; m++) bgCubeMips.push(bg(cubeMipPipe, [lvl(envTex, m - 1), lvl(envTex, m), { buffer: frameUBO }], 'cubemip' + m));
 
   // --------------------------------------------------------------------------------------
   // Render pipelines
   // --------------------------------------------------------------------------------------
   const MSAA = 4;
   const HDR = 'rgba16float';
+  const DEPTH = hasDS8 ? 'depth32float-stencil8' : 'depth32float';
+  // ocean shading pass: depth 'equal' to the pre-pass; the stencil (0 -> 1 on the first
+  // shade) makes later triangles that tie at exactly that depth lose, like 'greater' would
+  const FIRST_WINS = { compare: 'equal', passOp: 'increment-clamp' };
+  const shadeStencil = hasDS8 ? { stencilFront: FIRST_WINS, stencilBack: FIRST_WINS } : {};
   const [oceanMod, skyMod, downMod, upMod, compMod] = await Promise.all([
     shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
     shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
@@ -1809,7 +1887,20 @@ async function main() {
     },
     fragment: { module: oceanMod, entryPoint: 'fs', targets: [{ format: HDR }] },
     primitive: { topology: 'triangle-list', cullMode: 'none' },
-    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+    depthStencil: { format: DEPTH, depthWriteEnabled: false, depthCompare: 'equal', ...shadeStencil },
+    multisample: { count: MSAA },
+  });
+  // depth pre-pass: same vertex shader, no colour, so the shading pass above only runs its
+  // fragment shader where the surface is actually visible
+  const oceanDepthPipe = await device.createRenderPipelineAsync({
+    label: 'ocean depth', layout: 'auto',
+    vertex: {
+      module: oceanMod, entryPoint: 'vs',
+      buffers: [{ arrayStride: 16, stepMode: 'instance', attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x4' }] }],
+    },
+    fragment: { module: oceanMod, entryPoint: 'fsDepth', targets: [{ format: HDR, writeMask: 0 }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: DEPTH, depthWriteEnabled: true, depthCompare: 'greater' },
     multisample: { count: MSAA },
   });
   const skyPipe = await device.createRenderPipelineAsync({
@@ -1817,7 +1908,7 @@ async function main() {
     vertex: { module: skyMod, entryPoint: 'vs' },
     fragment: { module: skyMod, entryPoint: 'fs', targets: [{ format: HDR }] },
     primitive: { topology: 'triangle-list' },
-    depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'equal' },
+    depthStencil: { format: DEPTH, depthWriteEnabled: false, depthCompare: 'equal' },
     multisample: { count: MSAA },
   });
   const downPipe = await device.createRenderPipelineAsync({
@@ -1839,9 +1930,13 @@ async function main() {
     fragment: { module: compMod, entryPoint: 'fs', targets: [{ format: swapFormat }] },
   });
 
-  const bgOcean = [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp,
+  // (binding 1, the transmittance LUT, is unused now that the sun illuminance comes from Light)
+  const bgOcean = [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, null, skyView, sampClamp,
     fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView, sampRepeat,
-    fullArr(foamW[i]), { buffer: sunVisBuf }], 'ocean' + i));
+    fullArr(foamW[i]), { buffer: lightBuf }], 'ocean' + i));
+  // the depth-only pipeline's auto layout holds just the vertex shader's bindings
+  const bgOceanDepth = bg(oceanDepthPipe, [{ buffer: frameUBO }, null, null, null, fullArr(dispTex),
+    null, null, null, null, sampRepeat], 'ocean depth');
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
 
   // Water height under the camera (async readback, a few frames of latency) so the
@@ -1895,7 +1990,10 @@ async function main() {
   let colorMS, depthMS, hdrTex, bloomTex;
   const mainPass = {
     colorAttachments: [{ view: null, resolveTarget: null, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'discard' }],
-    depthStencilAttachment: { view: null, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'discard' },
+    depthStencilAttachment: {
+      view: null, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'discard',
+      ...(hasDS8 ? { stencilClearValue: 0, stencilLoadOp: 'clear', stencilStoreOp: 'discard' } : {}),
+    },
   };
   const compPass = {
     colorAttachments: [{ view: null, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
@@ -1913,7 +2011,7 @@ async function main() {
     canvas.width = W; canvas.height = H;
     for (const t of [colorMS, depthMS, hdrTex, bloomTex]) t && t.destroy();
     colorMS = device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
-    depthMS = device.createTexture({ size: [W, H], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+    depthMS = device.createTexture({ size: [W, H], format: DEPTH, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     hdrTex = device.createTexture({ size: [W, H], format: HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
     const bw = Math.max(1, W >> 1), bh = Math.max(1, H >> 1);
     bloomTex = device.createTexture({ size: [bw, bh], format: HDR, mipLevelCount: BLOOM_LEVELS, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
@@ -1975,6 +2073,7 @@ async function main() {
   const proj = new Float32Array(16), view = new Float32Array(16), viewProj = new Float32Array(16);
   const LOOP = 600.0;  // s, spectrum time loop (frequencies quantised to it)
   let needSpectrum = true, needLUT = true, envFull = 2;
+  const skyKey = new Float32Array([NaN, NaN, NaN]);  // sky-view LUT inputs it was last built for
 
   function writeSimStatic() {
     for (let c = 0; c < C; c++) {
@@ -2307,31 +2406,42 @@ async function main() {
     cp.setPipeline(probePipe);
     cp.setBindGroup(0, bgProbe);
     cp.dispatchWorkgroups(1);
-    cp.setPipeline(skyViewPipe);
-    cp.setBindGroup(0, bgSkyView);
-    cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
-    cp.setPipeline(sunVisPipe);
-    cp.setBindGroup(0, bgSunVis);
-    cp.dispatchWorkgroups(1);
+    // the sky-view LUT depends only on the sun elevation, the haze and the camera altitude
+    // (the transmittance / multi-scattering LUTs change only with the haze)
+    if (frameF[33] !== skyKey[0] || frameF[72] !== skyKey[1] || frameF[73] !== skyKey[2]) {
+      skyKey[0] = frameF[33]; skyKey[1] = frameF[72]; skyKey[2] = frameF[73];
+      cp.setPipeline(skyViewPipe);
+      cp.setBindGroup(0, bgSkyView);
+      cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
+    }
     cp.setPipeline(envPipe);
     cp.setBindGroup(0, bgEnv);
-    // one cube face per frame (all six on start-up / after parameter changes)
-    cp.dispatchWorkgroups(ENV_SIZE / 8, ENV_SIZE / 8, envFull > 0 ? 6 : 1);
+    // one cube face per frame (all six on start-up / after parameter changes); the mips are
+    // rebuilt for the refreshed faces only
+    const faces = envFull > 0 ? 6 : 1;
     if (envFull > 0) envFull--;
+    cp.dispatchWorkgroups(ENV_SIZE / 8, ENV_SIZE / 8, faces);
     cp.setPipeline(cubeMipPipe);
     for (let m = 1; m < ENV_MIPS; m++) {
       const s = Math.max(1, ENV_SIZE >> m);
       cp.setBindGroup(0, bgCubeMips[m - 1]);
-      cp.dispatchWorkgroups(Math.ceil(s / 8), Math.ceil(s / 8), 6);
+      cp.dispatchWorkgroups(Math.ceil(s / 8), Math.ceil(s / 8), faces);
     }
+    // after the env update: sun visibility plus the frame's lighting constants
+    cp.setPipeline(sunVisPipe);
+    cp.setBindGroup(0, bgSunVis);
+    cp.dispatchWorkgroups(1);
     cp.end();
 
     const rp = enc.beginRenderPass(mainPass);
     if (nodeCount) {
-      rp.setPipeline(oceanPipe);
-      rp.setBindGroup(0, bgOcean[foamCur]);
       rp.setVertexBuffer(0, instBuf);
       rp.setIndexBuffer(idxBuf, 'uint16');
+      rp.setPipeline(oceanDepthPipe);
+      rp.setBindGroup(0, bgOceanDepth);
+      rp.drawIndexed(GRID * GRID * 6, nodeCount);
+      rp.setPipeline(oceanPipe);
+      rp.setBindGroup(0, bgOcean[foamCur]);
       rp.drawIndexed(GRID * GRID * 6, nodeCount);
     }
     rp.setPipeline(skyPipe);

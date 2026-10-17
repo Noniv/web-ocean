@@ -68,8 +68,11 @@ async function main() {
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) fail('No WebGPU adapter found.');
   const hasTS = adapter.features.has('timestamp-query');
+  // a stencil plane lets the ocean shading pass keep the first of two triangles at exactly
+  // the same depth, as a single depth-tested pass does (see oceanPipe)
+  const hasDS8 = adapter.features.has('depth32float-stencil8');
   const device = await adapter.requestDevice({
-    requiredFeatures: hasTS ? ['timestamp-query'] : [],
+    requiredFeatures: [...(hasTS ? ['timestamp-query'] : []), ...(hasDS8 ? ['depth32float-stencil8'] : [])],
   });
   device.lost.then((i) => log('device lost: ' + i.message));
   device.onuncapturederror = (e) => log('GPU error: ' + e.error.message);
@@ -143,7 +146,8 @@ async function main() {
 
   const bg = (pipe, entries, label) => device.createBindGroup({
     label, layout: pipe.getBindGroupLayout(0),
-    entries: entries.map((r, i) => ({ binding: i, resource: r })),
+    // entry i is binding i; null skips a binding the pipeline's shaders do not use
+    entries: entries.map((r, i) => ({ binding: i, resource: r })).filter((e) => e.resource),
   });
   const bgInit = bg(initPipe, [{ buffer: simUBO }, { buffer: h0Buf }], 'init');
   const bgEvolve = bg(evolvePipe, [{ buffer: simUBO }, { buffer: h0Buf }, { buffer: specA }, { buffer: specB }], 'evolve');
@@ -227,7 +231,7 @@ async function main() {
     addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 16,
   });
   const frameUBO = mkBuf(384, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
-  const sunVisBuf = mkBuf(16, GU.STORAGE, 'sun visibility');
+  const lightBuf = mkBuf(64, GU.STORAGE, 'light');  // Light struct (see common.js)
   const transView = transLUT.createView();
   const msView = msLUT.createView();
   const skyView = skyLUT.createView();
@@ -236,15 +240,20 @@ async function main() {
   const bgMS = bg(msPipe, [{ buffer: atmoUBO }, transView, sampClamp, msView], 'ms');
   const bgSkyView = bg(skyViewPipe, [{ buffer: frameUBO }, transView, msView, sampClamp, skyView], 'skyview');
   const bgEnv = bg(envPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, lvl(envTex, 0)], 'env');
-  const bgSunVis = bg(sunVisPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, { buffer: sunVisBuf }], 'sunvis');
+  const bgSunVis = bg(sunVisPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, { buffer: lightBuf }, envCubeView], 'sunvis');
   const bgCubeMips = [];
-  for (let m = 1; m < ENV_MIPS; m++) bgCubeMips.push(bg(cubeMipPipe, [lvl(envTex, m - 1), lvl(envTex, m)], 'cubemip' + m));
+  for (let m = 1; m < ENV_MIPS; m++) bgCubeMips.push(bg(cubeMipPipe, [lvl(envTex, m - 1), lvl(envTex, m), { buffer: frameUBO }], 'cubemip' + m));
 
   // --------------------------------------------------------------------------------------
   // Render pipelines
   // --------------------------------------------------------------------------------------
   const MSAA = 4;
   const HDR = 'rgba16float';
+  const DEPTH = hasDS8 ? 'depth32float-stencil8' : 'depth32float';
+  // ocean shading pass: depth 'equal' to the pre-pass; the stencil (0 -> 1 on the first
+  // shade) makes later triangles that tie at exactly that depth lose, like 'greater' would
+  const FIRST_WINS = { compare: 'equal', passOp: 'increment-clamp' };
+  const shadeStencil = hasDS8 ? { stencilFront: FIRST_WINS, stencilBack: FIRST_WINS } : {};
   const [oceanMod, skyMod, downMod, upMod, compMod] = await Promise.all([
     shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
     shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
@@ -257,7 +266,20 @@ async function main() {
     },
     fragment: { module: oceanMod, entryPoint: 'fs', targets: [{ format: HDR }] },
     primitive: { topology: 'triangle-list', cullMode: 'none' },
-    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
+    depthStencil: { format: DEPTH, depthWriteEnabled: false, depthCompare: 'equal', ...shadeStencil },
+    multisample: { count: MSAA },
+  });
+  // depth pre-pass: same vertex shader, no colour, so the shading pass above only runs its
+  // fragment shader where the surface is actually visible
+  const oceanDepthPipe = await device.createRenderPipelineAsync({
+    label: 'ocean depth', layout: 'auto',
+    vertex: {
+      module: oceanMod, entryPoint: 'vs',
+      buffers: [{ arrayStride: 16, stepMode: 'instance', attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x4' }] }],
+    },
+    fragment: { module: oceanMod, entryPoint: 'fsDepth', targets: [{ format: HDR, writeMask: 0 }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: DEPTH, depthWriteEnabled: true, depthCompare: 'greater' },
     multisample: { count: MSAA },
   });
   const skyPipe = await device.createRenderPipelineAsync({
@@ -265,7 +287,7 @@ async function main() {
     vertex: { module: skyMod, entryPoint: 'vs' },
     fragment: { module: skyMod, entryPoint: 'fs', targets: [{ format: HDR }] },
     primitive: { topology: 'triangle-list' },
-    depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'equal' },
+    depthStencil: { format: DEPTH, depthWriteEnabled: false, depthCompare: 'equal' },
     multisample: { count: MSAA },
   });
   const downPipe = await device.createRenderPipelineAsync({
@@ -287,9 +309,13 @@ async function main() {
     fragment: { module: compMod, entryPoint: 'fs', targets: [{ format: swapFormat }] },
   });
 
-  const bgOcean = [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp,
+  // (binding 1, the transmittance LUT, is unused now that the sun illuminance comes from Light)
+  const bgOcean = [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, null, skyView, sampClamp,
     fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView, sampRepeat,
-    fullArr(foamW[i]), { buffer: sunVisBuf }], 'ocean' + i));
+    fullArr(foamW[i]), { buffer: lightBuf }], 'ocean' + i));
+  // the depth-only pipeline's auto layout holds just the vertex shader's bindings
+  const bgOceanDepth = bg(oceanDepthPipe, [{ buffer: frameUBO }, null, null, null, fullArr(dispTex),
+    null, null, null, null, sampRepeat], 'ocean depth');
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
 
   // Water height under the camera (async readback, a few frames of latency) so the
@@ -343,7 +369,10 @@ async function main() {
   let colorMS, depthMS, hdrTex, bloomTex;
   const mainPass = {
     colorAttachments: [{ view: null, resolveTarget: null, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'discard' }],
-    depthStencilAttachment: { view: null, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'discard' },
+    depthStencilAttachment: {
+      view: null, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'discard',
+      ...(hasDS8 ? { stencilClearValue: 0, stencilLoadOp: 'clear', stencilStoreOp: 'discard' } : {}),
+    },
   };
   const compPass = {
     colorAttachments: [{ view: null, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
@@ -361,7 +390,7 @@ async function main() {
     canvas.width = W; canvas.height = H;
     for (const t of [colorMS, depthMS, hdrTex, bloomTex]) t && t.destroy();
     colorMS = device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
-    depthMS = device.createTexture({ size: [W, H], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+    depthMS = device.createTexture({ size: [W, H], format: DEPTH, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     hdrTex = device.createTexture({ size: [W, H], format: HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
     const bw = Math.max(1, W >> 1), bh = Math.max(1, H >> 1);
     bloomTex = device.createTexture({ size: [bw, bh], format: HDR, mipLevelCount: BLOOM_LEVELS, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
@@ -423,6 +452,7 @@ async function main() {
   const proj = new Float32Array(16), view = new Float32Array(16), viewProj = new Float32Array(16);
   const LOOP = 600.0;  // s, spectrum time loop (frequencies quantised to it)
   let needSpectrum = true, needLUT = true, envFull = 2;
+  const skyKey = new Float32Array([NaN, NaN, NaN]);  // sky-view LUT inputs it was last built for
 
   function writeSimStatic() {
     for (let c = 0; c < C; c++) {
@@ -755,31 +785,42 @@ async function main() {
     cp.setPipeline(probePipe);
     cp.setBindGroup(0, bgProbe);
     cp.dispatchWorkgroups(1);
-    cp.setPipeline(skyViewPipe);
-    cp.setBindGroup(0, bgSkyView);
-    cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
-    cp.setPipeline(sunVisPipe);
-    cp.setBindGroup(0, bgSunVis);
-    cp.dispatchWorkgroups(1);
+    // the sky-view LUT depends only on the sun elevation, the haze and the camera altitude
+    // (the transmittance / multi-scattering LUTs change only with the haze)
+    if (frameF[33] !== skyKey[0] || frameF[72] !== skyKey[1] || frameF[73] !== skyKey[2]) {
+      skyKey[0] = frameF[33]; skyKey[1] = frameF[72]; skyKey[2] = frameF[73];
+      cp.setPipeline(skyViewPipe);
+      cp.setBindGroup(0, bgSkyView);
+      cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
+    }
     cp.setPipeline(envPipe);
     cp.setBindGroup(0, bgEnv);
-    // one cube face per frame (all six on start-up / after parameter changes)
-    cp.dispatchWorkgroups(ENV_SIZE / 8, ENV_SIZE / 8, envFull > 0 ? 6 : 1);
+    // one cube face per frame (all six on start-up / after parameter changes); the mips are
+    // rebuilt for the refreshed faces only
+    const faces = envFull > 0 ? 6 : 1;
     if (envFull > 0) envFull--;
+    cp.dispatchWorkgroups(ENV_SIZE / 8, ENV_SIZE / 8, faces);
     cp.setPipeline(cubeMipPipe);
     for (let m = 1; m < ENV_MIPS; m++) {
       const s = Math.max(1, ENV_SIZE >> m);
       cp.setBindGroup(0, bgCubeMips[m - 1]);
-      cp.dispatchWorkgroups(Math.ceil(s / 8), Math.ceil(s / 8), 6);
+      cp.dispatchWorkgroups(Math.ceil(s / 8), Math.ceil(s / 8), faces);
     }
+    // after the env update: sun visibility plus the frame's lighting constants
+    cp.setPipeline(sunVisPipe);
+    cp.setBindGroup(0, bgSunVis);
+    cp.dispatchWorkgroups(1);
     cp.end();
 
     const rp = enc.beginRenderPass(mainPass);
     if (nodeCount) {
-      rp.setPipeline(oceanPipe);
-      rp.setBindGroup(0, bgOcean[foamCur]);
       rp.setVertexBuffer(0, instBuf);
       rp.setIndexBuffer(idxBuf, 'uint16');
+      rp.setPipeline(oceanDepthPipe);
+      rp.setBindGroup(0, bgOceanDepth);
+      rp.drawIndexed(GRID * GRID * 6, nodeCount);
+      rp.setPipeline(oceanPipe);
+      rp.setBindGroup(0, bgOcean[foamCur]);
       rp.drawIndexed(GRID * GRID * 6, nodeCount);
     }
     rp.setPipeline(skyPipe);
