@@ -71,8 +71,7 @@ Cloud noise octaves are filtered by pixel footprint, and silhouettes are anti-al
 The soundscape is synthesised with Web Audio at start-up (noise and bubble buffers, no sample files), and every layer follows the simulation:
 
 - **Crests.** A compute pass samples the total surface Jacobian at 48 points in four rings around the camera, filtered exactly like the foam injection. When a point folds past the foam threshold, its deepest fold sets the loudness and length of a breaking burst (bubble fizz plus a lower whoosh), panned to where the crest is and attenuated with distance. So you hear whitecaps where you see foam appear. The rings widen as the camera climbs.
-- **Lapping.** Bubble gurgle and slosh near the surface follow how fast the water under the camera rises and falls, normalised by the spectrum's expected vertical velocity.
-- **Wash and sizzle.** The low roar of the sea scales with the significant wave height of the same JONSWAP spectrum the simulation uses, plus the measured whitecap cover. It swells with the swell and wind-sea peak periods.
+- **Wash.** The low swish of the sea scales with the significant wave height of the same JONSWAP spectrum the simulation uses, plus the measured whitecap cover. Near the water it follows the real wave under the camera: it swells as each crest passes and nearly falls silent in the troughs.
 - **Wind.** Wind noise uses the logarithmic wind profile at the camera's height, relative to the camera's own motion, so flying fast or upwind gets louder. It is panned towards where the wind comes from.
 
 Everything near the water fades as the camera climbs, until only wind and a distant hush remain.

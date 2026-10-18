@@ -36,7 +36,7 @@ export const P = {
   clouds: 0.40,
   veil: 0.36,
   bloom: 0.10,
-  sound: 0.7,          // master volume
+  sound: 1.0,          // master volume
 };
 const CASC_L = [1103.0, 211.3, 39.7, 7.43, 1.393, 0.2617];
 

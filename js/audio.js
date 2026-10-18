@@ -3,11 +3,8 @@
 // around the listener (the camera):
 //   wind     pink noise bands; speed from the log wind profile at the listener's height,
 //            relative to the moving camera, panned towards upwind
-//   wash     low roar of the open sea: wave height and whitecap cover, breathing with
-//            the swell and wind-sea peak periods
-//   sizzle   distant whitecap bubble fizz, from the measured breaking cover
-//   lapping  bubble gurgle and slosh near the surface, from how fast the water under the
-//            camera rises and falls
+//   wash     low swish of the passing waves: wave height and whitecap cover, loud while
+//            a crest passes under the camera and nearly silent in the troughs
 //   crests   breaking bursts wherever the surface folds around the listener (the same
 //            Jacobian test that injects whitecap foam), panned and attenuated by distance
 // Browsers only let audio start after a user gesture, so input handlers call start().
@@ -49,22 +46,18 @@ export function createOceanAudio(P) {
   // listener state: height above the water, camera right / forward (xz), smoothed velocity
   let hc = 2.4, rx = 1, rz = 0, fx = 0, fz = -1;
   let vx = 0, vy = 0, vz = 0, px = 0, py = 0, pz = 0, havePos = false, pending = 0;
-  // measured: mean |dh/dt| under the camera, fraction of probe points currently breaking
-  let lastH = 0, lastProbeT = 0, rise = 0, cover = 0;
-  let swellPh = 0, seaPh = 0, gust = 0, gustTarget = 0, gustT = 0;
+  // measured: water height under the camera, fraction of probe points currently breaking
+  let lastH = 0, lastProbeT = 0, cover = 0;
+  let gust = 0, gustTarget = 0, gustT = 0;
 
   // wave statistics of the simulated spectrum (same JONSWAP fit as SIM_INIT)
-  const sea = { hsW: 0, wpW: 0, wS: 0, hs: 0, wStd: 0 };
+  const sea = { hsW: 0, hs: 0 };
   function seaState() {
     const U = P.windSpeed, F = P.fetchKm * 1000;
     const wp = 22 * Math.cbrt(G * G / (U * F));
     const alpha = 0.076 * Math.pow(U * U / (F * G), 0.22);
     sea.hsW = 4 * Math.sqrt(alpha * G * G * (1 - 0.287 * Math.log(3.3)) / (5 * wp ** 4));
-    sea.wpW = wp;
-    sea.wS = Math.sqrt(G * 2 * Math.PI / P.swellLength);
     sea.hs = Math.hypot(sea.hsW, P.swellHs);
-    // std of the vertical surface velocity, approximating each system by its peak
-    sea.wStd = Math.hypot(sea.hsW * 0.25 * wp, P.swellHs * 0.25 * sea.wS);
   }
 
   function start() {
@@ -153,25 +146,8 @@ export function createOceanAudio(P) {
       let lp = 0;
       for (let i = 0; i < n; i++) { const w = rnd() * 2 - 1; lp += 0.35 * (w - lp); o[i] += 0.05 * (w - lp); }
     }
-    // lapping: clusters of large bubbles (170-1100 Hz) and soft slaps
-    function gurgle(o) {
-      const n = o.length;
-      for (let t = 0; ; ) {
-        t += -Math.log(1 - rnd()) / 5;
-        const i0 = Math.floor(t * sr);
-        if (i0 >= n) break;
-        for (let b = 2 + Math.floor(rnd() * 6); b > 0; b--) {
-          const f0 = 170 * Math.pow(1100 / 170, rnd());
-          bubble(o, i0 + Math.floor(rnd() * 0.12 * sr), f0, (0.4 + rnd()) * Math.sqrt(300 / f0), 0.1 + 0.3 * rnd());
-        }
-        const len = Math.min(n - i0, Math.floor(0.12 * sr)), tau = (0.01 + 0.02 * rnd()) * sr, a = 0.6 * rnd();
-        let lp = 0;
-        for (let k = 0; k < len; k++) { lp += 0.2 * (rnd() * 2 - 1 - lp); o[i0 + k] += a * lp * Math.exp(-k / tau); }
-      }
-    }
 
     const brownBuf = loopBuffer(9.1, brownNoise);
-    const gurgleBuf = loopBuffer(6.3, gurgle);
     pinkBuf = loopBuffer(7.3, pinkNoise);
     fizzBuf = loopBuffer(4.7, fizz);
 
@@ -203,11 +179,6 @@ export function createOceanAudio(P) {
       buffet: layer(brownBuf, 0.7, 'lowpass', 110, 0, 0),
       washL: layer(brownBuf, 0.1, 'lowpass', 400, 0, -0.6),
       washR: layer(brownBuf, 0.55, 'lowpass', 400, 0, 0.6),
-      sizzleL: layer(fizzBuf, 0.0, 'highpass', 1200, 0, -0.5),
-      sizzleR: layer(fizzBuf, 0.5, 'highpass', 1200, 0, 0.5),
-      lapL: layer(gurgleBuf, 0.0, 'bandpass', 500, 0.5, -0.35),
-      lapR: layer(gurgleBuf, 0.5, 'bandpass', 500, 0.5, 0.35),
-      slosh: layer(brownBuf, 0.35, 'lowpass', 300, 0, 0),
     };
   }
 
@@ -244,7 +215,7 @@ export function createOceanAudio(P) {
     const air = (dx * fx + dz * fz < -0.3 ? 0.6 : 1) / (1 + dist / 70);
     const att = 0.04 + 0.12 * size * Math.random();
     const tau = (0.18 + 0.3 * size * (0.5 + Math.random())) * (0.6 + 0.6 * strength);
-    voice(fizzBuf, (1800 + 1800 * Math.random()) * air, amp, att, tau, p);
+    voice(fizzBuf, (1800 + 1800 * Math.random()) * air, amp * 0.7, att, tau * 0.6, p);
     // the spilling water mass: lower, slower and louder for bigger breakers
     const whoosh = voice(pinkBuf, (300 + 500 * Math.random()) * Math.sqrt(air) / (0.7 + 0.3 * size),
       amp * 0.8 * Math.min(1, size), att * 1.6, tau * 1.3, p);
@@ -260,7 +231,6 @@ export function createOceanAudio(P) {
     const now = performance.now() / 1000;
     const dtp = now - lastProbeT;
     const fresh = lastProbeT > 0 && dtp > 0.004 && dtp < 0.5;
-    if (fresh) rise += (Math.abs(vals[0] - lastH) / dtp - rise) * Math.min(1, dtp * 4);
     lastH = vals[0]; lastProbeT = now;
     if (!ctx || ctx.state !== 'running') return;
     // one crest folding across several neighbouring points is one sound: onsets are
@@ -281,10 +251,13 @@ export function createOceanAudio(P) {
           breaking[i] = 2;
           const ox = probePts[i * 2], oz = probePts[i * 2 + 1], r = Math.hypot(ox, oz);
           const str = Math.min(1, (foamThresh - jMin[i]) / 0.25);
-          const a = crestAmp(str, Math.hypot(r, hc)), e = a * a;
-          const k = Math.floor((Math.atan2(oz, ox) / (2 * Math.PI) + 1) * SECTORS) % SECTORS;
-          secE[k] += e; secX[k] += e * ox / r; secZ[k] += e * oz / r; secR[k] += e * r;
-          secS[k] = Math.max(secS[k], str);
+          // the shallowest folds stay silent: together they only add up to a steady hiss
+          if (str >= 0.15) {
+            const a = crestAmp(str, Math.hypot(r, hc)), e = a * a;
+            const k = Math.floor((Math.atan2(oz, ox) / (2 * Math.PI) + 1) * SECTORS) % SECTORS;
+            secE[k] += e; secX[k] += e * ox / r; secZ[k] += e * oz / r; secR[k] += e * r;
+            secS[k] = Math.max(secS[k], str);
+          }
         }
         if (J > foamThresh + 0.1) breaking[i] = 0;
       }
@@ -338,35 +311,23 @@ export function createOceanAudio(P) {
     const w = air * (1 + 0.22 * gust);
     const wl = Math.pow(w / 20, 1.5);
     const wpan = -(ax * rx + az * rz) / (Math.hypot(ax, az) + 1e-6) * 0.6;   // from upwind
-    set(L.windA.g.gain, 1.1 * wl); set(L.windA.f.frequency, 160 + 38 * w); set(L.windA.p.pan, wpan - 0.3);
-    set(L.windB.g.gain, 0.8 * wl); set(L.windB.f.frequency, 240 + 52 * w); set(L.windB.p.pan, wpan + 0.3);
-    set(L.buffet.g.gain, 0.25 * wl * (0.7 + 0.3 * gust)); set(L.buffet.f.frequency, 70 + 4 * w);
+    // gusts change the loudness only: a band swept over noise sounds like a phaser
+    set(L.windA.g.gain, 1.1 * wl); set(L.windA.f.frequency, 160 + 38 * air, 1); set(L.windA.p.pan, wpan - 0.3);
+    set(L.windB.g.gain, 0.8 * wl); set(L.windB.f.frequency, 240 + 52 * air, 1); set(L.windB.p.pan, wpan + 0.3);
+    set(L.buffet.g.gain, 0.25 * wl * (0.7 + 0.3 * gust)); set(L.buffet.f.frequency, 70 + 4 * air, 1);
 
-    // the sea itself: wave height and whitecap cover, swelling with the wave groups
+    // the sea itself: wave height and whitecap cover. Near the water it swishes as each
+    // crest passes under the camera (height in units of its std, Hs / 4) and drops away
+    // in the troughs; from high up the whole sea blends into an even hush.
     const sl = Math.min(1.6, sea.hs / 2.5);
     const cov = Math.min(0.25, cover);
-    swellPh += T * sea.wS;
-    seaPh += T * sea.wpW * (0.9 + 0.2 * Math.sin(swellPh * 0.17));
-    const sw = P.swellHs / (sea.hs + 1e-3), ww = sea.hsW / (sea.hs + 1e-3);
-    const breathL = 1 + 0.35 * sw * Math.sin(swellPh) + 0.25 * ww * Math.sin(seaPh);
-    const breathR = 1 + 0.35 * sw * Math.sin(swellPh + 0.8) + 0.25 * ww * Math.sin(seaPh + 1.9);
-    const kb = 1 / (1 + hc / 40);
-    const wash = 0.22 * kb * Math.sqrt(sl) * (1 + 6 * cov);
+    const x = lastH / (0.25 * sea.hs + 0.05);
+    const kn = 1 / (1 + Math.max(0, hc - 0.9) / 5);
+    const env = 0.5 + kn * (Math.max(0.08, Math.min(1.2, 0.5 + 0.35 * x)) - 0.5);
+    const wash = 0.3 * env * Math.sqrt(sl) * (1 + 4 * cov) / (1 + hc / 40);
     const washF = 180 + 300 * sl / (1 + hc / 150);
-    set(L.washL.g.gain, wash * breathL); set(L.washL.f.frequency, washF);
-    set(L.washR.g.gain, wash * breathR); set(L.washR.f.frequency, washF * 1.1);
-    const sizzle = 0.5 / (1 + hc / 20) * Math.sqrt(cov);
-    set(L.sizzleL.g.gain, sizzle * breathL); set(L.sizzleR.g.gain, sizzle * breathR);
-
-    // close to the surface: lapping and slosh follow the vertical water motion
-    const kn = 1 / (1 + Math.max(0, hc - 0.9) / 2.5);
-    const act = Math.min(2.5, rise / (0.8 * sea.wStd + 0.02));   // ~1 on average
-    const lap = 0.55 * kn * kn * (0.2 + 0.8 * Math.min(1.5, act)) *
-      (0.35 + 0.65 * Math.min(1, P.windSpeed / 10)) * Math.min(1.2, 0.3 + sl);
-    set(L.lapL.g.gain, lap); set(L.lapR.g.gain, lap);
-    set(L.lapL.f.frequency, 380 + 220 * act); set(L.lapR.f.frequency, 420 + 220 * act);
-    set(L.slosh.g.gain, 0.3 * kn * kn * Math.min(2, act) * Math.sqrt(sl));
-    set(L.slosh.f.frequency, 160 + 260 * act);
+    set(L.washL.g.gain, wash, 0.25); set(L.washL.f.frequency, washF, 1);
+    set(L.washR.g.gain, wash, 0.25); set(L.washR.f.frequency, washF * 1.1, 1);
 
     // distant breakers beyond the probe rings, at the measured cover rate
     if (Math.random() < Math.min(2, 25 * cov) * T) {
