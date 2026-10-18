@@ -75,7 +75,7 @@ The soundscape is synthesised with Web Audio at start-up (noise and bubble buffe
 - **Seagulls.** Synthetic gull calls (a laughing series of falling "kyow" notes, sometimes after a long wail, with a rough nasal voice) come from random directions and distances, and another gull sometimes answers. Call rate and volume are panel sliders; a rate of 0 turns them off.
 - **Wind.** Wind noise uses the logarithmic wind profile at the camera's height, relative to the camera's own motion, so flying fast or upwind gets louder. It is panned towards where the wind comes from.
 
-Everything near the water fades as the camera climbs, until only wind and a distant hush remain.
+The sea fades steeply as the camera climbs (about -6 dB at 10 m, -13 dB at 30 m, -22 dB at 100 m), since the nearby surface dominates what you hear, until only wind and a distant hush remain.
 
 ### Post-processing
 

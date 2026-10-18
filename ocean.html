@@ -1817,7 +1817,8 @@ function createOceanAudio(P) {
     const rnd = Math.random;
     const t0 = ctx.currentTime + delay;
     const f0 = 700 + 400 * rnd();                   // this bird's voice
-    const dist = 15 + 110 * rnd() ** 1.5;           // m, mostly close by
+    // mostly close by, flying 3-25 m above the water: climbing past them puts them below
+    const dist = Math.hypot(15 + 110 * rnd() ** 1.5, hc - 3 - 22 * rnd());
     const amp = 0.45 * P.gullVol / (1 + dist / 15);
     const osc = ctx.createOscillator();
     osc.setPeriodicWave(gullWave);
@@ -1944,9 +1945,10 @@ function createOceanAudio(P) {
     px = cam.x; py = cam.y; pz = cam.z; havePos = true;
     seaState();
 
-    // wind at the listener's height (log profile, z0 = 0.2 mm), as the moving camera feels it
+    // wind at the listener's height (log profile up to the 10 m reference, z0 = 0.2 mm),
+    // as the moving camera feels it
     const wa = P.windDir * Math.PI / 180;
-    const uz = P.windSpeed * Math.log(Math.max(hc, 0.5) / 2e-4) / Math.log(10 / 2e-4);
+    const uz = P.windSpeed * Math.log(Math.min(Math.max(hc, 0.5), 10) / 2e-4) / Math.log(10 / 2e-4);
     const ax = Math.cos(wa) * uz - vx, ay = -vy, az = Math.sin(wa) * uz - vz;
     const air = Math.min(45, Math.hypot(ax, ay, az));
     gustT -= T;
@@ -1968,7 +1970,8 @@ function createOceanAudio(P) {
     const x = lastH / (0.25 * sea.hs + 0.05);
     const kn = 1 / (1 + Math.max(0, hc - 0.9) / 5);
     const env = 0.5 + kn * (Math.max(0.08, Math.min(1.2, 0.5 + 0.35 * x)) - 0.5);
-    const wash = 0.3 * env * Math.sqrt(sl) * (1 + 4 * cov) / (1 + hc / 40);
+    // the nearby surface dominates what you hear: -6 dB at 10 m, -13 at 30 m, -22 at 100 m
+    const wash = 0.32 * env * Math.sqrt(sl) * (1 + 4 * cov) / (1 + hc / 6);
     const washF = 180 + 300 * sl / (1 + hc / 150);
     set(L.washL.g.gain, wash, 0.25); set(L.washL.f.frequency, washF, 1);
     set(L.washR.g.gain, wash, 0.25); set(L.washR.f.frequency, washF * 1.1, 1);
