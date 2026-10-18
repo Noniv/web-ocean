@@ -1,6 +1,7 @@
 // Ocean surface + sky background rendering.
-import { FRAME_WGSL, ATMO_CORE_WGSL, ENV_MIPS, ENV_SIZE, N, CASCADES } from './common.js';
+import { FRAME_WGSL, ATMO_CORE_WGSL, ENV_MIPS, ENV_SIZE, N, CASCADES, PROBE_PTS } from './common.js';
 import { SKY_RENDER_FUNCS, SKY_CLOUD_FUNCS } from './sky.js';
+import { FOAM_RES } from './sim.js';
 
 const RENDER_BINDINGS = /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
@@ -277,8 +278,10 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
 export const HEIGHT_PROBE = FRAME_WGSL + /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var dispTex: texture_2d_array<f32>;
-@group(0) @binding(2) var samp: sampler;
-@group(0) @binding(3) var<storage, read_write> outH: array<f32, 4>;
+@group(0) @binding(2) var derivTex: texture_2d_array<f32>;
+@group(0) @binding(3) var samp: sampler;
+@group(0) @binding(4) var<storage, read> pts: array<vec2f, ${PROBE_PTS}>;
+@group(0) @binding(5) var<storage, read_write> outP: array<f32, ${PROBE_PTS + 1}>;
 fn dispAt(xz: vec2f) -> vec3f {
   var d = vec3f(0.0);
   for (var c = 0u; c < ${CASCADES}u; c++) {
@@ -286,14 +289,37 @@ fn dispAt(xz: vec2f) -> vec3f {
   }
   return d;
 }
-@compute @workgroup_size(1)
-fn main() {
-  let goal = F.camPos.xz;
-  var x0 = goal;
-  for (var i = 0; i < 4; i++) {
-    let d = dispAt(x0);
-    x0 = goal - d.xz;
+// Total surface Jacobian, filtered to the foam clipmap texel size ts exactly like
+// FOAM_UPDATE, so it folds where whitecap foam gets injected.
+fn jacobianAt(xz: vec2f, ts: f32) -> f32 {
+  var jxx = 0.0; var jzz = 0.0; var jxz = 0.0;
+  for (var c = 0u; c < ${CASCADES}u; c++) {
+    let invL = F.cascInvL[c >> 2u][c & 3u];
+    let lod = log2(max(ts * ${N}.0 * invL, 1.0));
+    if (lod < 7.5) {
+      let uv = xz * invL;
+      let d = textureSampleLevel(derivTex, samp, uv, c, lod);
+      let a = textureSampleLevel(dispTex, samp, uv, c, lod);
+      jxx += d.z; jzz += d.w; jxz += a.w;
+    }
   }
-  outH[0] = dispAt(x0).y;
+  return (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
+}
+// outP[0]: water height under the camera, outP[1 + i]: Jacobian at camera + pts[i]
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_index) i: u32) {
+  if (i == 0u) {
+    let goal = F.camPos.xz;
+    var x0 = goal;
+    for (var k = 0; k < 4; k++) {
+      let d = dispAt(x0);
+      x0 = goal - d.xz;
+    }
+    outP[0] = dispAt(x0).y;
+  } else if (i <= ${PROBE_PTS}u) {
+    let o = pts[i - 1u];
+    let far = max(abs(o.x), abs(o.y)) > 0.3 * F.lodP.z;
+    outP[i] = jacobianAt(F.camPos.xz + o, select(F.lodP.z, F.lodP.w, far) / ${FOAM_RES}.0);
+  }
 }
 `;

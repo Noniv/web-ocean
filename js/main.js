@@ -2,11 +2,12 @@
 // FFT ocean (5 cascades) + CDLOD surface mesh + physically based sky + HDR post.
 // All per-frame data lives in preallocated typed arrays / descriptors (no per-frame garbage
 // apart from the unavoidable swap-chain view and command buffer objects).
-import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS } from './wgsl/common.js';
+import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS, PROBE_PTS } from './wgsl/common.js';
 import { SIM_INIT, SIM_EVOLVE, FFT_ROWS, FFT_COLS, SIM_MIPS, FOAM_TEX, RGBA8_MIPS, FOAM_UPDATE, ARRAY16_MIPS, FOAM_RES } from './wgsl/sim.js';
 import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, ENV_CUBE, CUBE_MIPS, SUN_VIS } from './wgsl/sky.js';
 import { OCEAN, SKY_BG, HEIGHT_PROBE } from './wgsl/ocean.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
+import { createOceanAudio } from './audio.js';
 
 const qs = new URLSearchParams(location.search);
 const DBG = Number(qs.get('dbg')) || 0;
@@ -35,6 +36,7 @@ export const P = {
   clouds: 0.40,
   veil: 0.36,
   bloom: 0.10,
+  sound: 0.7,          // master volume
 };
 const CASC_L = [1103.0, 211.3, 39.7, 7.43, 1.393, 0.2617];
 
@@ -293,16 +295,24 @@ async function main() {
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
 
   // Water height under the camera (async readback, a few frames of latency) so the
-  // floating camera rides above passing crests instead of clipping into them.
+  // floating camera rides above passing crests instead of clipping into them. The same
+  // pass samples the surface Jacobian at points around the camera for the sound.
+  const audio = createOceanAudio(P);
+  const PROBE_BYTES = (PROBE_PTS + 1) * 4;
   const probePipe = await computePipe(HEIGHT_PROBE, 'height probe');
-  const probeOut = mkBuf(16, GU.STORAGE | GU.COPY_SRC, 'probe out');
-  const probeRead = mkBuf(16, GU.MAP_READ | GU.COPY_DST, 'probe read');
-  const bgProbe = bg(probePipe, [{ buffer: frameUBO }, fullArr(dispTex), samplerSim, { buffer: probeOut }], 'probe');
+  const probePts = mkBuf(PROBE_PTS * 8, GU.STORAGE | GU.COPY_DST, 'probe points');
+  const probeOut = mkBuf(PROBE_BYTES, GU.STORAGE | GU.COPY_SRC, 'probe out');
+  const probeRead = mkBuf(PROBE_BYTES, GU.MAP_READ | GU.COPY_DST, 'probe read');
+  const bgProbe = bg(probePipe, [{ buffer: frameUBO }, fullArr(dispTex), fullArr(derivTex), samplerSim,
+    { buffer: probePts }, { buffer: probeOut }], 'probe');
+  const probeVals = new Float32Array(PROBE_PTS + 1);
   let probePending = false, waterH = 0;
   const onProbe = () => {
-    waterH = new Float32Array(probeRead.getMappedRange(0, 16))[0];
+    probeVals.set(new Float32Array(probeRead.getMappedRange(0, PROBE_BYTES)));
     probeRead.unmap();
     probePending = false;
+    waterH = probeVals[0];
+    audio.onProbe(probeVals, foamUF[12]);
   };
   const onProbeFail = () => { probePending = false; };
 
@@ -449,12 +459,20 @@ async function main() {
   }
   if (qs.get('fov')) cam.fovY = Number(qs.get('fov')) * D2R;
   const keys = Object.create(null);
-  addEventListener('keydown', (e) => { keys[e.code] = true; if (e.code === 'KeyH') togglePanel(); });
+  // audio may only start on a user gesture: the first click or key press starts it
+  addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (e.code === 'KeyH') togglePanel();
+    if (e.code === 'KeyM') audio.toggle(); else audio.start();
+  });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
   addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
-  canvas.addEventListener('click', () => { if (document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
+  canvas.addEventListener('click', () => {
+    audio.start();
+    if (document.pointerLockElement !== canvas) canvas.requestPointerLock();
+  });
   let dragging = false;
-  canvas.addEventListener('mousedown', (e) => { if (e.button === 2) dragging = true; });
+  canvas.addEventListener('mousedown', (e) => { audio.start(); if (e.button === 2) dragging = true; });
   addEventListener('mouseup', () => { dragging = false; });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   addEventListener('mousemove', (e) => {
@@ -621,6 +639,7 @@ async function main() {
     ['veil', 'Cloud deck', 0, 1, 0.01, ''],
     ['exposure', 'Exposure', 0.1, 4, 0.01, ''],
     ['bloom', 'Bloom', 0, 0.3, 0.001, ''],
+    ['sound', 'Sound volume', 0, 1.5, 0.01, 'audio'],
   ];
   for (const [key, label, min, max, step, kind] of SLIDERS) {
     const row = document.createElement('label');
@@ -632,7 +651,7 @@ async function main() {
       P[key] = Number(inp.value); val.textContent = inp.value;
       if (kind === 'spec') needSpectrum = true;
       if (kind === 'lut') needLUT = true;
-      envFull = 2;
+      if (kind !== 'audio') envFull = 2;
     });
     row.append(name, inp, val);
     panel.appendChild(row);
@@ -720,6 +739,7 @@ async function main() {
     }
     if (fixedDt) dt = fixedDt;
     updateCamera(dt);
+    audio.update(dt, cam, waterH);
     simTime += dt;
     if (simTime > LOOP) simTime -= LOOP;
     frameIndex++;
@@ -729,6 +749,7 @@ async function main() {
     simF[52] = simTime; simF[53] = dt;
     device.queue.writeBuffer(simUBO, 0, simF);
     writeFoamUniforms(dt);
+    device.queue.writeBuffer(probePts, 0, audio.probePts);
     selectAll();
     if (nodeCount) device.queue.writeBuffer(instBuf, 0, instData, 0, nodeCount * 4);
 
@@ -754,7 +775,7 @@ async function main() {
     encodeSim(cp);
     cp.setPipeline(probePipe);
     cp.setBindGroup(0, bgProbe);
-    cp.dispatchWorkgroups(1);
+    cp.dispatchWorkgroups(1);  // one workgroup: height + PROBE_PTS Jacobian samples
     cp.setPipeline(skyViewPipe);
     cp.setBindGroup(0, bgSkyView);
     cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
@@ -814,8 +835,8 @@ async function main() {
     pc.end();
 
     let doProbe = false;
-    if (!probePending && (frameIndex & 7) === 0) {
-      enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, 16);
+    if (!probePending && (frameIndex & 1) === 0) {
+      enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, PROBE_BYTES);
       doProbe = true;
     }
     let doTs = false;

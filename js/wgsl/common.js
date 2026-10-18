@@ -6,6 +6,7 @@ export const SKY_W = 256;      // sky-view LUT size
 export const SKY_H = 144;
 export const ENV_SIZE = 256;   // environment cube face size
 export const ENV_MIPS = 9;
+export const PROBE_PTS = 48;   // surface sample points around the listener (audio)
 
 // Per-frame uniform block shared by every render / sky shader.
 // Layout must match the Float32Array offsets in main.js (FR_* constants).

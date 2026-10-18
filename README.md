@@ -1,6 +1,6 @@
 # web-ocean
 
-A real-time ocean renderer written from scratch on WebGPU, with no engine or rendering library. It draws a sunset sea with simulated waves, whitecaps, sun glitter, and a physically based sky with clouds. You fly around it with a free camera.
+A real-time ocean renderer written from scratch on WebGPU, with no engine or rendering library. It draws a sunset sea with simulated waves, whitecaps, sun glitter, and a physically based sky with clouds, and plays a procedural sea soundscape driven by the same simulation. You fly around it with a free camera.
 
 ![Looking toward the sun from 2.4 m above the water](docs/front.jpg)
 
@@ -27,15 +27,18 @@ After editing anything under `js/`, run `npm run build` to regenerate both bundl
 
 | Input | Action |
 |---|---|
-| Click the canvas | Capture the mouse (Esc releases it). Holding the right mouse button also works. |
+| Click the canvas | Capture the mouse (Esc releases it) and start the sound. Holding the right mouse button also works. |
 | Mouse | Look around |
 | W A S D | Move |
 | Space or E / Q or C | Up / down |
 | Shift | 5x speed |
 | Mouse wheel | Change base speed |
-| H | Settings panel: wind, swell, choppiness, turbidity, foam, sun, haze, clouds, exposure, bloom |
+| H | Settings panel: wind, swell, choppiness, turbidity, foam, sun, haze, clouds, exposure, bloom, sound volume |
+| M | Mute or unmute the sound |
 
 The camera keeps itself above the displaced water surface, so waves never pass through it.
+
+Browsers block audio until the page gets a click or key press, so the sound starts with the first one.
 
 URL parameters are handy for testing. `?w=2560&h=1440` forces the render resolution, `cam=x,y,z,yawDeg,pitchDeg` sets the camera, `fov=deg` sets the field of view, `ui=0` hides the HUD, and any settings key works too, for example `windSpeed=12&swellHs=2&sunElev=8`.
 
@@ -63,6 +66,17 @@ The atmosphere follows Hillaire's approach, with transmittance, multiple-scatter
 
 Cloud noise octaves are filtered by pixel footprint, and silhouettes are anti-aliased analytically: the screen-space derivative of each layer's edge function sets the width of its opacity edge. Cloud transmittance along the sun direction dims the sunlight that reaches the water, and aerial perspective is applied over the sea.
 
+### Sound
+
+The soundscape is synthesised with Web Audio at start-up (noise and bubble buffers, no sample files), and every layer follows the simulation:
+
+- **Crests.** A compute pass samples the total surface Jacobian at 48 points in four rings around the camera, filtered exactly like the foam injection. When a point folds past the foam threshold, its deepest fold sets the loudness and length of a breaking burst (bubble fizz plus a lower whoosh), panned to where the crest is and attenuated with distance. So you hear whitecaps where you see foam appear. The rings widen as the camera climbs.
+- **Lapping.** Bubble gurgle and slosh near the surface follow how fast the water under the camera rises and falls, normalised by the spectrum's expected vertical velocity.
+- **Wash and sizzle.** The low roar of the sea scales with the significant wave height of the same JONSWAP spectrum the simulation uses, plus the measured whitecap cover. It swells with the swell and wind-sea peak periods.
+- **Wind.** Wind noise uses the logarithmic wind profile at the camera's height, relative to the camera's own motion, so flying fast or upwind gets louder. It is panned towards where the wind comes from.
+
+Everything near the water fades as the camera climbs, until only wind and a distant hush remain.
+
 ### Post-processing
 
 The scene renders in HDR with 4x MSAA. Post-processing adds an 8-level bloom, AgX tone mapping, a slight white balance shift, and dithering.
@@ -71,7 +85,7 @@ The scene renders in HDR with 4x MSAA. Post-processing adds an 8-level bloom, Ag
 
 At 2560 by 1440 on an RTX 5070 Ti, the GPU takes about 6 to 8 ms per frame, measured while other programs were also using the GPU. The HUD shows FPS and GPU time when the browser supports `timestamp-query`.
 
-The per-frame code reuses preallocated typed arrays and descriptors, so the garbage collector has almost nothing to do. The only recurring allocations are the objects WebGPU itself requires, such as the swap-chain view and command buffers.
+The per-frame code reuses preallocated typed arrays and descriptors, so the garbage collector has almost nothing to do. The only recurring allocations are the objects WebGPU itself requires, such as the swap-chain view and command buffers, and a few Web Audio nodes per breaking crest.
 
 ## Known limitations
 
@@ -90,6 +104,7 @@ I built this with Claude Code (Opus 5.5). I asked for the most realistic water i
 |---|---|
 | `index.html` | Page shell, HUD, and settings panel styles |
 | `js/main.js` | Device setup, resources, camera, per-frame loop |
+| `js/audio.js` | Procedural sound driven by the simulation and the surface probe |
 | `js/wgsl/` | Shaders as JavaScript modules: `sim.js` (waves and foam), `sky.js` (atmosphere and clouds), `ocean.js` (surface and sky pass), `post.js` (bloom and tone mapping), `common.js` (shared structs) |
 | `server.mjs` | Tiny static server for development |
 | `build.mjs` | Builds `ocean.html` and `ocean.min.html` |
