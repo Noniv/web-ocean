@@ -7,6 +7,7 @@
 //            a crest passes under the camera and nearly silent in the troughs
 //   crests   breaking bursts wherever the surface folds around the listener (the same
 //            Jacobian test that injects whitecap foam), panned and attenuated by distance
+//   gulls    synthetic seagull calls at a random rate and direction (panel sliders)
 // Browsers only let audio start after a user gesture, so input handlers call start().
 import { PROBE_PTS } from './wgsl/common.js';
 
@@ -42,7 +43,7 @@ export function createOceanAudio(P) {
   layoutRings(1);
 
   let ctx = null, master = null, bus = null, L = null, pinkBuf = null, fizzBuf = null;
-  let enabled = true, voices = 0;
+  let enabled = true, voices = 0, gulls = 0, gullWave = null;
   // listener state: height above the water, camera right / forward (xz), smoothed velocity
   let hc = 2.4, rx = 1, rz = 0, fx = 0, fz = -1;
   let vx = 0, vy = 0, vz = 0, px = 0, py = 0, pz = 0, havePos = false, pending = 0;
@@ -150,6 +151,9 @@ export function createOceanAudio(P) {
     const brownBuf = loopBuffer(9.1, brownNoise);
     pinkBuf = loopBuffer(7.3, pinkNoise);
     fizzBuf = loopBuffer(4.7, fizz);
+    // gull voice: strong low harmonics, a nasal formant is added per call
+    const harm = [0, 1, 0.9, 0.75, 0.5, 0.4, 0.25, 0.18, 0.1, 0.06, 0.04];
+    gullWave = ctx.createPeriodicWave(new Float32Array(harm.length), Float32Array.from(harm));
 
     const comp = ctx.createDynamicsCompressor();
     comp.threshold.value = -14; comp.knee.value = 10; comp.ratio.value = 4;
@@ -223,6 +227,67 @@ export function createOceanAudio(P) {
     return true;
   }
   const crestAmp = (strength, dist) => 1.4 * strength * (0.8 + 0.2 * Math.random()) / (1 + dist / 4);
+
+  // --------------------------------------------------------------------------------------
+  // Seagulls: each note jumps up and glides down ("kyow"), roughened by a fast amplitude
+  // flutter; a call is a laughing series of notes, sometimes after a long wail
+  // --------------------------------------------------------------------------------------
+  function gullCall(delay) {
+    if (gulls >= 4 || P.gullVol <= 0) return;
+    gulls++;
+    const rnd = Math.random;
+    const t0 = ctx.currentTime + delay;
+    const f0 = 700 + 400 * rnd();                   // this bird's voice
+    const dist = 15 + 110 * rnd() ** 1.5;           // m, mostly close by
+    const amp = 0.45 * P.gullVol / (1 + dist / 15);
+    const osc = ctx.createOscillator();
+    osc.setPeriodicWave(gullWave);
+    const flutter = ctx.createOscillator();
+    flutter.frequency.value = 35 + 30 * rnd();
+    const depth = ctx.createGain();
+    depth.gain.value = 0.35;
+    const rough = ctx.createGain();
+    rough.gain.value = 0.65;
+    flutter.connect(depth).connect(rough.gain);
+    const env = ctx.createGain();
+    env.gain.value = 0;
+    const formant = ctx.createBiquadFilter();
+    formant.type = 'peaking'; formant.frequency.value = 2200 + 600 * rnd(); formant.Q.value = 1.2; formant.gain.value = 8;
+    const air = ctx.createBiquadFilter();
+    air.type = 'lowpass'; air.frequency.value = 12000 / (1 + dist / 60);
+    const pan = ctx.createStereoPanner();
+    osc.connect(rough).connect(env).connect(formant).connect(air).connect(pan).connect(bus);
+
+    let t = t0;
+    const note = (dur, a, up, down) => {
+      osc.frequency.setValueAtTime(f0, t);
+      osc.frequency.linearRampToValueAtTime(f0 * up, t + 0.04);
+      osc.frequency.exponentialRampToValueAtTime(f0 * down, t + dur);
+      env.gain.setValueAtTime(0, t);
+      env.gain.linearRampToValueAtTime(a, t + 0.02);
+      env.gain.setValueAtTime(a, t + dur * 0.6);
+      env.gain.linearRampToValueAtTime(0, t + dur);
+    };
+    if (rnd() < 0.35) {
+      const d = 0.45 + 0.35 * rnd();
+      note(d, amp, 1.3, 0.75);
+      t += d + 0.15 + 0.1 * rnd();
+    }
+    for (let k = 0, n = 2 + Math.floor(rnd() * 5); k < n; k++) {
+      const d = 0.13 + 0.12 * rnd();
+      note(d, amp * (1 - 0.08 * k), 1.25, 0.8);
+      t += d + 0.07 + 0.08 * rnd();
+    }
+    // the bird flies on while it calls
+    const p0 = 1.8 * rnd() - 0.9;
+    pan.pan.setValueAtTime(p0, t0);
+    pan.pan.linearRampToValueAtTime(Math.max(-1, Math.min(1, p0 + 0.6 * (rnd() - 0.5))), t);
+    osc.start(t0); flutter.start(t0);
+    osc.stop(t + 0.05); flutter.stop(t + 0.05);
+    osc.onended = () => { gulls--; pan.disconnect(); };
+    // another gull sometimes answers from elsewhere
+    if (rnd() < 0.35) gullCall(t - ctx.currentTime + 0.3 + rnd());
+  }
 
   // --------------------------------------------------------------------------------------
   // Probe results (water height under the camera, surface Jacobian around it)
@@ -334,6 +399,8 @@ export function createOceanAudio(P) {
       const a = Math.random() * 2 * Math.PI, r = (40 + 160 * Math.random()) * ringScale;
       crest(crestAmp(0.5, Math.hypot(r, hc)), Math.cos(a), Math.sin(a), r, 0.5);
     }
+    // answers add ~50% more calls: P.gulls ends up as the total calls per minute
+    if (Math.random() < P.gulls / 90 * T) gullCall(0);
     set(master.gain, enabled ? P.sound : 0, 0.08);
   }
 

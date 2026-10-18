@@ -37,6 +37,8 @@ export const P = {
   veil: 0.36,
   bloom: 0.10,
   sound: 1.0,          // master volume
+  gulls: 4,            // seagull calls per minute
+  gullVol: 0.7,
 };
 const CASC_L = [1103.0, 211.3, 39.7, 7.43, 1.393, 0.2617];
 
@@ -640,6 +642,8 @@ async function main() {
     ['exposure', 'Exposure', 0.1, 4, 0.01, ''],
     ['bloom', 'Bloom', 0, 0.3, 0.001, ''],
     ['sound', 'Sound volume', 0, 1.5, 0.01, 'audio'],
+    ['gulls', 'Seagull calls (/min)', 0, 30, 0.5, 'audio'],
+    ['gullVol', 'Seagull volume', 0, 1.5, 0.01, 'audio'],
   ];
   for (const [key, label, min, max, step, kind] of SLIDERS) {
     const row = document.createElement('label');

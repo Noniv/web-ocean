@@ -33,7 +33,7 @@ After editing anything under `js/`, run `npm run build` to regenerate both bundl
 | Space or E / Q or C | Up / down |
 | Shift | 5x speed |
 | Mouse wheel | Change base speed |
-| H | Settings panel: wind, swell, choppiness, turbidity, foam, sun, haze, clouds, exposure, bloom, sound volume |
+| H | Settings panel: wind, swell, choppiness, turbidity, foam, sun, haze, clouds, exposure, bloom, sound volume, seagull call rate and volume |
 | M | Mute or unmute the sound |
 
 The camera keeps itself above the displaced water surface, so waves never pass through it.
@@ -72,6 +72,7 @@ The soundscape is synthesised with Web Audio at start-up (noise and bubble buffe
 
 - **Crests.** A compute pass samples the total surface Jacobian at 48 points in four rings around the camera, filtered exactly like the foam injection. When a point folds past the foam threshold, its deepest fold sets the loudness and length of a breaking burst (bubble fizz plus a lower whoosh), panned to where the crest is and attenuated with distance. So you hear whitecaps where you see foam appear. The rings widen as the camera climbs.
 - **Wash.** The low swish of the sea scales with the significant wave height of the same JONSWAP spectrum the simulation uses, plus the measured whitecap cover. Near the water it follows the real wave under the camera: it swells as each crest passes and nearly falls silent in the troughs.
+- **Seagulls.** Synthetic gull calls (a laughing series of falling "kyow" notes, sometimes after a long wail, with a rough nasal voice) come from random directions and distances, and another gull sometimes answers. Call rate and volume are panel sliders; a rate of 0 turns them off.
 - **Wind.** Wind noise uses the logarithmic wind profile at the camera's height, relative to the camera's own motion, so flying fast or upwind gets louder. It is panned towards where the wind comes from.
 
 Everything near the water fades as the camera climbs, until only wind and a distant hush remain.
