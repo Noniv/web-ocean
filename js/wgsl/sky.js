@@ -1,5 +1,5 @@
 // Physically based atmosphere (Hillaire 2020 style LUTs) + procedural cloud deck.
-import { FRAME_WGSL, ATMO_CORE_WGSL, NOISE_WGSL, SKY_W, SKY_H, ENV_SIZE } from './common.js';
+import { FRAME_WGSL, ATMO_CORE_WGSL, LIGHT_WGSL, NOISE_WGSL, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS } from './common.js';
 
 const ATMO_UNIFORM = /* wgsl */ `
 struct AtmoP { haze: vec4f };   // x = mie multiplier
@@ -245,6 +245,8 @@ fn cloudFbm(p: vec2f, fp: f32, oct: i32, billow: f32) -> f32 {
   for (var i = 0; i < oct; i++) {
     // fade octaves well before they reach pixel size (half-res buffer) -> no shimmer in motion
     let w = 1.0 - smoothstep(0.08, 0.28, fp * f);
+    // the weight only falls as f grows: once an octave is fully faded, so are all the rest
+    if (w <= 0.0) { break; }
     var n = gnoise(q);
     if (i >= 2) { n = mix(n, abs(n) * 2.0 - 0.38, billow); }
     s += a * n * w;
@@ -323,6 +325,11 @@ fn shadeLayer(dir: vec3f, h: CloudHit, hc: f32, d: f32, s1: f32, s2: f32, s3: f3
 // aa: per-layer edge change per pixel (fwidth of the edge function); negative = estimate it
 // from the pixel footprint (compute passes, which have no derivatives)
 fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> vec4f {
+  return cloudLayersE(dir, pixAng, aa, vec2f(0.0), false, sunT);
+}
+// haveE: edges holds the layers' edge values at this pixel (low, high), already evaluated by
+// the caller with the same hit and footprint, so they are not computed a second time
+fn cloudLayersE(dir: vec3f, pixAng: f32, aa: vec2f, edges: vec2f, haveE: bool, sunT: ptr<function, f32>) -> vec4f {
   *sunT = 1.0;
   if (dir.y <= 0.0) { return vec4f(0.0); }
   let sxz = F.sunDir.xz / max(length(F.sunDir.xz), 1e-4);
@@ -335,7 +342,8 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
     let far = 1.0 - smoothstep(18.0, 36.0, h.t);
     if (far > 0.0) {
       let fp = h.t * pixAng / h.mu;
-      let e = lowEdge(h.q, fp, 7);
+      var e = edges.x;
+      if (!haveE) { e = lowEdge(h.q, fp, 7); }
       let d = clamp(e / lowSoft(fp), 0.0, 1.0) * far;
       if (d > 0.002) {
         let s1 = lowDensity(h.q + sxz * 0.08, fp, 5) * far;
@@ -358,7 +366,8 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
     let far = 1.0 - smoothstep(30.0, 70.0, h.t);
     if (far > 0.0) {
       let fp = h.t * pixAng / h.mu;
-      let e = highEdge(h.q, fp, 6);
+      var e = edges.y;
+      if (!haveE) { e = highEdge(h.q, fp, 6); }
       let d = clamp(e / highSoft(fp), 0.0, 1.0) * far;
       if (d > 0.002) {
         let s1 = highDensity(h.q + sxz * 0.15, fp, 4) * far;
@@ -443,13 +452,18 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 }
 `;
 
-export const CUBE_MIPS = /* wgsl */ `
+// Mips are rebuilt only for the faces the env pass refreshed this frame (dispatch z = their
+// count): face = (frame + z) % 6, the same rotation as ENV_CUBE. Each face's mips depend only
+// on that face, so the others are already up to date.
+export const CUBE_MIPS = FRAME_WGSL + /* wgsl */ `
 @group(0) @binding(0) var src: texture_2d_array<f32>;
 @group(0) @binding(1) var dst: texture_storage_2d_array<rgba16float, write>;
+@group(0) @binding(2) var<uniform> F: Frame;
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3u) {
   let size = textureDimensions(dst);
   if (id.x >= size.x || id.y >= size.y) { return; }
+  let face = (u32(F.post.z) + id.z) % 6u;
   let srcSize = vec2i(textureDimensions(src));
   let p = vec2i(id.xy) * 2;
   // 4x4 tent-ish filter for smoother roughness blur
@@ -459,23 +473,26 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     for (var i = -1; i <= 2; i++) {
       let q = clamp(p + vec2i(i, j), vec2i(0), srcSize - 1);
       let w = select(1.0, 3.0, i == 0 || i == 1) * select(1.0, 3.0, j == 0 || j == 1);
-      acc += textureLoad(src, q, id.z, 0) * w;
+      acc += textureLoad(src, q, face, 0) * w;
       wsum += w;
     }
   }
-  textureStore(dst, id.xy, id.z, acc / wsum);
+  textureStore(dst, id.xy, face, acc / wsum);
 }
 `;
 
 // Cloud transmittance towards the sun (averaged over the solar disc), used to dim
-// direct sunlight on the water when the sun is behind clouds.
-export const SUN_VIS = FRAME_WGSL + ATMO_CORE_WGSL + /* wgsl */ `
+// direct sunlight on the water when the sun is behind clouds. Runs after the env cube update
+// and also stores the frame's lighting constants for the ocean shader (Light).
+export const SUN_VIS = FRAME_WGSL + ATMO_CORE_WGSL + LIGHT_WGSL + /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var transLUT: texture_2d<f32>;
 @group(0) @binding(2) var skyLUT: texture_2d<f32>;
 @group(0) @binding(3) var sampC: sampler;
-@group(0) @binding(4) var<storage, read_write> sunVis: array<f32, 4>;
+@group(0) @binding(4) var<storage, read_write> light: Light;
+@group(0) @binding(5) var envCube: texture_cube<f32>;
 ` + SKY_RENDER_FUNCS + SKY_CLOUD_FUNCS + /* wgsl */ `
+const ENV_MAXMIP: f32 = ${ENV_MIPS - 1}.0;
 var<workgroup> part: array<f32, 8>;
 // one ray per thread (7 rays across the disc), then a tiny reduction
 @compute @workgroup_size(8)
@@ -495,7 +512,17 @@ fn main(@builtin(local_invocation_index) k: u32) {
   if (k == 0u) {
     var acc = 0.0;
     for (var i = 0u; i < 7u; i++) { acc += part[i]; }
-    sunVis[0] = acc / 7.0;
+    let vis = acc / 7.0;
+    light.sunVis = vec4f(vis, 0.0, 0.0, 0.0);
+    light.sunE = vec4f(sunIlluminance() * vis, 0.0);
+    let skyUp = textureSampleLevel(envCube, sampC, vec3f(0.0, 1.0, 0.0), ENV_MAXMIP).rgb;
+    light.skyUp = vec4f(skyUp, 0.0);
+    // average radiance of the whole upper hemisphere (incl. the bright horizon band)
+    light.skyHemi = vec4f(skyUp * 0.4 + 0.15 * (
+        textureSampleLevel(envCube, sampC, vec3f(0.94, 0.34, 0.0), ENV_MAXMIP - 1.0).rgb +
+        textureSampleLevel(envCube, sampC, vec3f(-0.94, 0.34, 0.0), ENV_MAXMIP - 1.0).rgb +
+        textureSampleLevel(envCube, sampC, vec3f(0.0, 0.34, 0.94), ENV_MAXMIP - 1.0).rgb +
+        textureSampleLevel(envCube, sampC, vec3f(0.0, 0.34, -0.94), ENV_MAXMIP - 1.0).rgb), 0.0);
   }
 }
 `;
