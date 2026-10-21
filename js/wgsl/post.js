@@ -69,7 +69,7 @@ fn tap(uv: vec2f) -> vec3f { return textureSampleLevel(src, samp, uv, 0.0).rgb; 
 `;
 
 export const COMPOSITE = FS_TRI + /* wgsl */ `
-struct P { p: vec4f, q: vec4f };  // p: exposure, bloom, frame, vignette; q: saturation, contrast, warmth, grain
+struct P { p: vec4f, q: vec4f, r: vec4f };  // p: exposure, bloom, frame, vignette; q: saturation, contrast, warmth, grain; r: sun uv, shaft strength
 @group(0) @binding(0) var hdr: texture_2d<f32>;
 @group(0) @binding(1) var bloom: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
@@ -107,7 +107,25 @@ fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.0671105
 @fragment fn fs(in: VO) -> @location(0) vec4f {
   let dims = vec2f(textureDimensions(hdr));
   let pc = vec2i(in.pos.xy);
-  var c = textureLoad(hdr, pc, 0).rgb;
+  let px = textureLoad(hdr, pc, 0);
+  var c = px.rgb;
+  // sun shafts: the fraction of the line to the sun that is clear sky, so paths through
+  // cloud gaps come out bright and paths through clouds dark; faded with distance from the
+  // sun on screen. alpha holds how much sunlight gets through the clouds there (-1 on the sea)
+  if (U.r.z > 0.0) {
+    let toSun = U.r.xy - in.uv;
+    let dv = toSun / 64.0;
+    var uv = in.uv + dv * fract(sin(dot(in.pos.xy, vec2f(12.9898, 78.233))) * 43758.5453);
+    var acc = vec3f(0.0);
+    for (var i = 0; i < 64; i++) {
+      let s = textureSampleLevel(hdr, samp, uv, 0.0);
+      acc += min(s.rgb, vec3f(U.r.w)) * max(s.a, 0.0);
+      uv += dv;
+    }
+    // strongest in the open sky between clouds, faint over clouds, none on the sea
+    c += acc * (U.r.z / 64.0) * exp(-length(toSun * vec2f(dims.x / dims.y, 1.0)) * 2.0)
+       * select(mix(0.1, 1.0, px.a), 0.0, px.a < 0.0);
+  }
   // the up-chain accumulates 8 blur levels
   let b = textureSampleLevel(bloom, samp, in.uv, 0.0).rgb * (1.0 / 8.0);
   c = mix(c, b, U.p.y);

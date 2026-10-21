@@ -4,7 +4,7 @@
 // apart from the unavoidable swap-chain view and command buffer objects).
 import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS } from './wgsl/common.js';
 import { SIM_INIT, SIM_EVOLVE, FFT_ROWS, FFT_COLS, SIM_MIPS, FOAM_TEX, RGBA8_MIPS, FOAM_UPDATE, ARRAY16_MIPS, FOAM_RES } from './wgsl/sim.js';
-import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, ENV_CUBE, CUBE_MIPS, SUN_VIS } from './wgsl/sky.js';
+import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, ENV_CUBE, CUBE_MIPS, SUN_VIS, NOISE3D } from './wgsl/sky.js';
 import { OCEAN, SKY_BG, HEIGHT_PROBE } from './wgsl/ocean.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
 
@@ -32,9 +32,10 @@ export const P = {
   sunAzim: 4,          // deg (0 = straight ahead of the start view)
   exposure: 1.35,
   haze: 3.0,
-  clouds: 0.40,
+  clouds: 0.68,
   veil: 0.36,
   bloom: 0.10,
+  shafts: 3.0,
 };
 const CASC_L = [1103.0, 211.3, 39.7, 7.43, 1.393, 0.2617];
 
@@ -126,7 +127,7 @@ async function main() {
   const fullArr = (t) => t.createView({ dimension: '2d-array' });
 
   const [initPipe, evolvePipe, rowsPipe, colsPipe, simMipPipe, foamGenPipe, rgba8MipPipe,
-    transPipe, msPipe, skyViewPipe, envPipe, cubeMipPipe, foamUpdPipe, arr16MipPipe, sunVisPipe] = await Promise.all([
+    transPipe, msPipe, skyViewPipe, envPipe, cubeMipPipe, foamUpdPipe, arr16MipPipe, sunVisPipe, noise3Pipe] = await Promise.all([
     computePipe(SIM_INIT, 'sim init'),
     computePipe(SIM_EVOLVE, 'sim evolve'),
     computePipe(FFT_ROWS, 'fft rows'),
@@ -142,6 +143,7 @@ async function main() {
     computePipe(FOAM_UPDATE, 'foam update'),
     computePipe(ARRAY16_MIPS, 'array16 mips'),
     computePipe(SUN_VIS, 'sun visibility'),
+    computePipe(NOISE3D, 'cloud noise'),
   ]);
 
   const bg = (pipe, entries, label) => device.createBindGroup({
@@ -166,6 +168,11 @@ async function main() {
     label: 'foam detail', size: [FOAM_SIZE, FOAM_SIZE], format: 'rgba8unorm', mipLevelCount: FOAM_MIPS,
     usage: TU.TEXTURE_BINDING | TU.STORAGE_BINDING,
   });
+  // Tiling 3D noise for the cloud volume (generated once)
+  const noise3Tex = device.createTexture({
+    label: 'cloud noise', size: [128, 128, 128], dimension: '3d', format: 'rgba8unorm',
+    usage: TU.TEXTURE_BINDING | TU.STORAGE_BINDING,
+  });
   {
     const enc = device.createCommandEncoder();
     const cp = enc.beginComputePass();
@@ -178,6 +185,9 @@ async function main() {
       cp.setBindGroup(0, bg(rgba8MipPipe, [lvl(foamTex, m - 1, '2d'), lvl(foamTex, m, '2d')]));
       cp.dispatchWorkgroups(Math.ceil(s / 8), Math.ceil(s / 8));
     }
+    cp.setPipeline(noise3Pipe);
+    cp.setBindGroup(0, bg(noise3Pipe, [noise3Tex.createView()]));
+    cp.dispatchWorkgroups(32, 32, 32);
     cp.end();
     device.queue.submit([enc.finish()]);
   }
@@ -228,7 +238,7 @@ async function main() {
   });
   const sampRepeat = device.createSampler({
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
-    addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 16,
+    addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat', maxAnisotropy: 16,
   });
   const frameUBO = mkBuf(384, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
   const lightBuf = mkBuf(64, GU.STORAGE, 'light');  // Light struct (see common.js)
@@ -239,8 +249,9 @@ async function main() {
   const bgTrans = bg(transPipe, [{ buffer: atmoUBO }, transView], 'trans');
   const bgMS = bg(msPipe, [{ buffer: atmoUBO }, transView, sampClamp, msView], 'ms');
   const bgSkyView = bg(skyViewPipe, [{ buffer: frameUBO }, transView, msView, sampClamp, skyView], 'skyview');
-  const bgEnv = bg(envPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, lvl(envTex, 0)], 'env');
-  const bgSunVis = bg(sunVisPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, { buffer: lightBuf }, envCubeView], 'sunvis');
+  const noise3View = noise3Tex.createView();
+  const bgEnv = bg(envPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, noise3View, sampRepeat, lvl(envTex, 0)], 'env');
+  const bgSunVis = bg(sunVisPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, noise3View, sampRepeat, { buffer: lightBuf }, envCubeView], 'sunvis');
   const bgCubeMips = [];
   for (let m = 1; m < ENV_MIPS; m++) bgCubeMips.push(bg(cubeMipPipe, [lvl(envTex, m - 1), lvl(envTex, m), { buffer: frameUBO }], 'cubemip' + m));
 
@@ -316,7 +327,7 @@ async function main() {
   // the depth-only pipeline's auto layout holds just the vertex shader's bindings
   const bgOceanDepth = bg(oceanDepthPipe, [{ buffer: frameUBO }, null, null, null, fullArr(dispTex),
     null, null, null, null, sampRepeat], 'ocean depth');
-  const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
+  const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, noise3View, sampRepeat], 'sky');
 
   // Water height under the camera (async readback, a few frames of latency) so the
   // floating camera rides above passing crests instead of clipping into them.
@@ -360,8 +371,8 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const BLOOM_LEVELS = 8;
   const linSamp = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
-  const compUBO = mkBuf(32, GU.UNIFORM | GU.COPY_DST, 'composite ubo');
-  const compData = new Float32Array(8);
+  const compUBO = mkBuf(48, GU.UNIFORM | GU.COPY_DST, 'composite ubo');
+  const compData = new Float32Array(12);
   const bloomUBOs = [];
   for (let i = 0; i < BLOOM_LEVELS * 2; i++) bloomUBOs.push(mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'bloom ubo'));
 
@@ -587,6 +598,11 @@ async function main() {
   let simTime = Number(qs.get('t')) || 0;
   let frameIndex = 0;
 
+  // sun direction projected on a camera axis stored at fr[o..o+2] (scaled by tan of the half fov)
+  function sunNdc(fr, o, sd) {
+    const len2 = fr[o] * fr[o] + fr[o + 1] * fr[o + 1] + fr[o + 2] * fr[o + 2];
+    return (fr[o] * fr[32] + fr[o + 1] * fr[33] + fr[o + 2] * fr[34]) / (len2 * sd);
+  }
   function writeFrame(time) {
     const aspect = W / H;
     const tanY = Math.tan(cam.fovY * 0.5), tanX = tanY * aspect;
@@ -649,6 +665,7 @@ async function main() {
     ['haze', 'Haze', 0.5, 15, 0.1, 'lut'],
     ['clouds', 'Low clouds', 0, 1, 0.01, ''],
     ['veil', 'Cloud deck', 0, 1, 0.01, ''],
+    ['shafts', 'Sun shafts', 0, 6, 0.01, ''],
     ['exposure', 'Exposure', 0.1, 4, 0.01, ''],
     ['bloom', 'Bloom', 0, 0.3, 0.001, ''],
   ];
@@ -845,6 +862,10 @@ async function main() {
 
     compData[0] = P.exposure; compData[1] = P.bloom; compData[2] = frameIndex % 64; compData[3] = 0.10;
     compData[4] = 1.05; compData[5] = 1.06; compData[6] = -0.19; compData[7] = 0;
+    // sun position on screen for the shafts (off when the sun is behind the camera)
+    const fr = frameF, sd = fr[28] * fr[32] + fr[29] * fr[33] + fr[30] * fr[34];
+    compData[8] = 0.5 + 0.5 * sunNdc(fr, 20, sd); compData[9] = 0.5 - 0.5 * sunNdc(fr, 24, sd);
+    compData[10] = sd > 0.1 ? P.shafts : 0; compData[11] = 8.0;
     device.queue.writeBuffer(compUBO, 0, compData);
     const swapTex = ctx.getCurrentTexture();
     compPass.colorAttachments[0].view = swapTex.createView();

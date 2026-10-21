@@ -59,13 +59,13 @@ The surface mesh is a CDLOD quadtree with 17 levels. Vertices are 6.25 cm apart 
 
 ### Sky
 
-The atmosphere follows Hillaire's approach, with transmittance, multiple-scattering, and sky-view lookup tables plus aerosol haze. There are two cloud layers, a broken low cumulus and a fibrous altostratus deck. Each is shaded with self-shadowing toward the sun, lit rims, silver linings when backlit, and direction-dependent multiple scattering.
+The atmosphere follows Hillaire's approach, with transmittance, multiple-scattering, and sky-view lookup tables plus aerosol haze. The low cumulus are ray-marched through a slab between 1.2 and 3.6 km. Their density comes from a tiling 128³ Perlin-Worley noise generated once at startup: flat bases, rounded tops, billowy eroded edges, and a low-frequency weather field that groups them with clear sky between. Each step takes four taps toward the sun and three scattering octaves, so interiors show soft light gradients and backlit edges get silver linings. A fibrous altostratus deck above is still a thin 2D layer.
 
-Cloud noise octaves are filtered by pixel footprint, and silhouettes are anti-aliased analytically: the screen-space derivative of each layer's edge function sets the width of its opacity edge. Cloud transmittance along the sun direction dims the sunlight that reaches the water, and aerial perspective is applied over the sea.
+The deck's noise octaves are filtered by pixel footprint, and its silhouettes are anti-aliased analytically: the screen-space derivative of its edge function sets the width of its opacity edge. The march starts at a random offset per pixel to hide step banding. Cloud transmittance along the sun direction dims the sunlight that reaches the water, and aerial perspective is applied over the sea.
 
 ### Post-processing
 
-The scene renders in HDR with 4x MSAA. Post-processing adds an 8-level bloom, AgX tone mapping, a slight white balance shift, and dithering.
+The scene renders in HDR with 4x MSAA. Post-processing adds an 8-level bloom, AgX tone mapping, a slight white balance shift, and dithering. Sun shafts come from the composite pass: it marches toward the sun and measures how much of the line is clear sky (the sky pass writes cloud transmittance to alpha and the sea writes -1), so gaps in the clouds stream light and clouds cast dark shafts.
 
 ## Performance
 

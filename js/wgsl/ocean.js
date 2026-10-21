@@ -26,17 +26,16 @@ struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
   var d2 = dir;
   d2.y = max(d2.y, 0.0005);
   d2 = normalize(d2);
-  // edge functions at this pixel (uniform control flow, so fwidth is valid)
-  let hl = hitLayer(d2, F.cloudP.x);
-  let el = lowEdge(hl.q, hl.t * pixAng / hl.mu, 7);
+  // high-deck edge function at this pixel (uniform control flow, so fwidth is valid)
   let hh = hitLayer(d2, 4.5);
   let eh = highEdge(hh.q, hh.t * pixAng / hh.mu, 6);
-  let aa = vec2f(fwidth(el), fwidth(eh));
+  // per-pixel random start of the cloud march hides step banding
+  let jit = f32(pcgHash(u32(in.pos.x) * 1973u + pcgHash(u32(in.pos.y)))) / 4294967296.0;
   var sunT = 1.0;
-  // reuse the edge values: cloudLayers would evaluate the same two noise stacks again
-  let cl = cloudLayersE(d2, pixAng, aa, vec2f(el, eh), true, &sunT);
+  let cl = cloudLayers(d2, pixAng, fwidth(eh), 56, jit, &sunT);
   let L = skyAtmo(d2) * (1.0 - cl.a) + cl.rgb + sunDisk(dir) * sunT;
-  return vec4f(L, 1.0);
+  // alpha = sunlight getting through the clouds (the sea writes -1): mask for the sun shafts
+  return vec4f(L, sunT);
 }
 `;
 
@@ -295,7 +294,7 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let hz = normalize(vec3f(-V.x, 0.002, -V.z));
   let fogCol = skyAtmo(hz);
   col = col * T + fogCol * (1.0 - T);
-  return vec4f(col, 1.0);
+  return vec4f(col, -1.0);  // alpha -1 marks the sea for the sun-shaft pass
 }
 
 // depth pre-pass: no colour output (the pipeline's colour writeMask is 0)
