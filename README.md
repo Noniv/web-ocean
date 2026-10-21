@@ -12,7 +12,7 @@ A real-time ocean renderer written from scratch on WebGPU, with no engine or ren
 
 You need a recent Chrome with WebGPU and a reasonably capable GPU. On a laptop, force Chrome onto the dedicated GPU in the Windows graphics settings, or it will fall back to the integrated one.
 
-Open `ocean.html` directly in the browser. `ocean.min.html` is the same page minified (61 KB instead of 102 KB). Both are self-contained and work from `file://`.
+Open `ocean.html` directly in the browser. `ocean.min.html` is the same page minified (64 KB instead of 109 KB). Both are self-contained and work from `file://`.
 
 To run from source:
 
@@ -37,7 +37,7 @@ After editing anything under `js/`, run `npm run build` to regenerate both bundl
 
 The camera keeps itself above the displaced water surface, so waves never pass through it.
 
-URL parameters are handy for testing. `?w=2560&h=1440` forces the render resolution, `cam=x,y,z,yawDeg,pitchDeg` sets the camera, `fov=deg` sets the field of view, `ui=0` hides the HUD, and any settings key works too, for example `windSpeed=12&swellHs=2&sunElev=8`.
+URL parameters are handy for testing. `?w=2560&h=1440` forces the render resolution, `cam=x,y,z,yawDeg,pitchDeg` sets the camera, `fov=deg` sets the field of view, `ui=0` hides the HUD, and any settings key works too, for example `windSpeed=12&swellHs=2&sunElev=8`. To embed the ocean as a page background cheaply, `maxw=1280` caps the render width (the browser upscales the canvas) and `fps=30` caps the frame rate.
 
 ## How it works
 
@@ -69,7 +69,7 @@ The scene renders in HDR with 4x MSAA. Post-processing adds an 8-level bloom, Ag
 
 ## Performance
 
-At 2560 by 1440 on an RTX 5070 Ti, the GPU takes about 6 to 8 ms per frame, measured while other programs were also using the GPU. The HUD shows FPS and GPU time when the browser supports `timestamp-query`.
+At 2560 by 1440 on an RTX 4070 Ti, the GPU takes about 2 to 3 ms per frame. The ocean is drawn in two passes, depth first, so its full shader runs only once per pixel. The HUD shows FPS and GPU time when the browser supports `timestamp-query`.
 
 The per-frame code reuses preallocated typed arrays and descriptors, so the garbage collector has almost nothing to do. The only recurring allocations are the objects WebGPU itself requires, such as the swap-chain view and command buffers.
 

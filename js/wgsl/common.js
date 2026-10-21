@@ -32,6 +32,17 @@ struct Frame {
 };
 `;
 
+// Per-frame lighting constants, written once per frame by the sun-visibility pass (after the
+// env cube update) so the ocean shader reads them instead of re-deriving them per pixel.
+export const LIGHT_WGSL = /* wgsl */ `
+struct Light {
+  sunVis:  vec4f,   // x = cloud transmittance towards the sun
+  sunE:    vec4f,   // rgb = sun illuminance at the camera * sunVis
+  skyUp:   vec4f,   // rgb = env cube zenith radiance (coarsest mip)
+  skyHemi: vec4f,   // rgb = average upper-hemisphere radiance
+};
+`;
+
 export const ATMO_CORE_WGSL = /* wgsl */ `
 const PI: f32 = 3.14159265358979;
 const RG: f32 = 6360.0;
