@@ -35,6 +35,8 @@ After editing anything under `js/`, run `npm run build` to regenerate both bundl
 | Mouse wheel | Change base speed |
 | H | Settings panel: wind, swell, choppiness, turbidity, foam, sun, haze, clouds, exposure, bloom |
 
+With `?auto=1` the camera flies itself, for use as a page background: it starts 30 m up facing the sun, drifts at 1 m/s, rises and falls between about 5 and 56 m, and pans within about 23 degrees of the sun. Any mouse or keyboard input takes over.
+
 The camera keeps itself above the displaced water surface, so waves never pass through it.
 
 URL parameters are handy for testing. `?w=2560&h=1440` forces the render resolution, `cam=x,y,z,yawDeg,pitchDeg` sets the camera, `fov=deg` sets the field of view, `ui=0` hides the HUD, and any settings key works too, for example `windSpeed=12&swellHs=2&sunElev=8`.

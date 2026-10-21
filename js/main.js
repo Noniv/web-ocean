@@ -478,6 +478,10 @@ async function main() {
     cam.x = v[0]; cam.y = v[1]; cam.z = v[2]; cam.yaw = (v[3] || 0) * D2R; cam.pitch = (v[4] || 0) * D2R;
   }
   if (qs.get('fov')) cam.fovY = Number(qs.get('fov')) * D2R;
+  // ?auto=1: ambient camera for backgrounds. Starts 30 m up facing the sun, then drifts at
+  // 1 m/s, rises and falls between ~5 and 56 m, and pans within ~23 deg of the sun.
+  const auto = { on: qs.get('auto') === '1', t: 0, yaw0: P.sunAzim * D2R, pitch0: -3 * D2R };
+  if (auto.on && !qs.get('cam')) { cam.x = 0; cam.z = 0; cam.y = 30; cam.yaw = auto.yaw0; cam.pitch = auto.pitch0; }
   const keys = Object.create(null);
   addEventListener('keydown', (e) => { keys[e.code] = true; if (e.code === 'KeyH') togglePanel(); });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
@@ -509,6 +513,18 @@ async function main() {
     const boost = keys.ShiftLeft || keys.ShiftRight ? 5 : 1;
     const v = cam.speed * boost * dt;
     cam.x += mx * v; cam.y += my * v; cam.z += mz * v;
+    if (auto.on && !(fwd || str || up || dragging || document.pointerLockElement === canvas)) {
+      auto.t += dt;
+      const t = auto.t;
+      // position: drift at 1 m/s along a slowly turning heading
+      const hdg = 0.7 * Math.sin(t * 0.017) + 0.5 * Math.sin(t * 0.009 + 2.1);
+      cam.x += Math.cos(hdg) * 1.0 * dt;
+      cam.z += Math.sin(hdg) * 1.0 * dt;
+      cam.y = 30 - 23 * Math.sin(t * 0.05) + 3 * Math.sin(t * 0.019); // dips to ~9 m within 30 s, ~2 min cycle
+      // view angle: slow, smooth, non-repeating pan, never more than ~23 deg from the sun
+      cam.yaw   = auto.yaw0   + 0.24 * Math.sin(t * 0.05) + 0.16 * Math.sin(t * 0.013 + 1.1);
+      cam.pitch = auto.pitch0 + 0.03 * Math.sin(t * 0.03);
+    }
     cam.y = Math.max(1.0, Math.min(3000, cam.y));
     // keep clear of the actual (displaced) water surface under the camera
     if (cam.y < waterH + 0.9) cam.y += (waterH + 0.9 - cam.y) * Math.min(1, dt * 12);
