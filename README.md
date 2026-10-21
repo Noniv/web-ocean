@@ -37,7 +37,7 @@ After editing anything under `js/`, run `npm run build` to regenerate both bundl
 
 The camera keeps itself above the displaced water surface, so waves never pass through it.
 
-URL parameters are handy for testing. `?w=2560&h=1440` forces the render resolution, `cam=x,y,z,yawDeg,pitchDeg` sets the camera, `fov=deg` sets the field of view, `ui=0` hides the HUD, and any settings key works too, for example `windSpeed=12&swellHs=2&sunElev=8`.
+URL parameters are handy for testing. `?w=2560&h=1440` forces the render resolution, `cam=x,y,z,yawDeg,pitchDeg` sets the camera, `fov=deg` sets the field of view, `ui=0` hides the HUD, and any settings key works too, for example `windSpeed=12&swellHs=2&sunElev=8`. To embed the ocean as a page background cheaply, `maxw=1280` caps the render width (the browser upscales the canvas) and `fps=30` caps the frame rate.
 
 ## How it works
 

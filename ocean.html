@@ -2004,8 +2004,11 @@ async function main() {
   function resize() {
     const fw = Number(qs.get('w')) || 0, fh = Number(qs.get('h')) || 0;
     const dpr = window.devicePixelRatio || 1;
-    const w = fw || Math.max(1, Math.round(canvas.clientWidth * dpr));
-    const h = fh || Math.max(1, Math.round(canvas.clientHeight * dpr));
+    let w = fw || Math.max(1, Math.round(canvas.clientWidth * dpr));
+    let h = fh || Math.max(1, Math.round(canvas.clientHeight * dpr));
+    // ?maxw=N caps the render width (the browser upscales the canvas): cheap backgrounds
+    const mw = Number(qs.get('maxw')) || 0;
+    if (mw && w > mw) { h = Math.max(1, Math.round(h * mw / w)); w = mw; }
     if (w === W && h === H) return;
     W = w; H = h;
     canvas.width = W; canvas.height = H;
@@ -2303,6 +2306,7 @@ async function main() {
   let shotIdx = 0;
   const fixedDt = shotName ? 1 / 60 : 0;
   let last = performance.now();
+  const minFrameMs = qs.get('fps') ? 1000 / Number(qs.get('fps')) - 2 : 0;
   let fpsAcc = 0, fpsN = 0, fpsT = 0;
   let shooting = false;
 
@@ -2359,6 +2363,7 @@ async function main() {
   function frame(now) {
     if (shooting) return;  // paused while a screenshot is read back
     requestAnimationFrame(frame);
+    if (now - last < minFrameMs) return;  // ?fps=N frame-rate cap
     resize();
     let dt = Math.min(0.1, (now - last) / 1000);
     last = now;
