@@ -12,7 +12,7 @@ A real-time ocean renderer written from scratch on WebGPU, with no engine or ren
 
 You need a recent Chrome with WebGPU and a reasonably capable GPU. On a laptop, force Chrome onto the dedicated GPU in the Windows graphics settings, or it will fall back to the integrated one.
 
-Open `ocean.html` directly in the browser. `ocean.min.html` is the same page minified (61 KB instead of 102 KB). Both are self-contained and work from `file://`.
+Open `ocean.html` directly in the browser. `ocean.min.html` is the same page minified (64 KB instead of 109 KB). Both are self-contained and work from `file://`.
 
 To run from source:
 
@@ -59,17 +59,17 @@ The surface mesh is a CDLOD quadtree with 17 levels. Vertices are 6.25 cm apart 
 
 ### Sky
 
-The atmosphere follows Hillaire's approach, with transmittance, multiple-scattering, and sky-view lookup tables plus aerosol haze. There are two cloud layers, a broken low cumulus and a fibrous altostratus deck. Each is shaded with self-shadowing toward the sun, lit rims, silver linings when backlit, and direction-dependent multiple scattering.
+The atmosphere follows Hillaire's approach, with transmittance, multiple-scattering, and sky-view lookup tables plus aerosol haze. The low cumulus are ray-marched through a slab between 1.2 and 3.6 km. Their density comes from a tiling 128³ Perlin-Worley noise generated once at startup: flat bases, rounded tops, billowy eroded edges, and a low-frequency weather field that groups them with clear sky between. Each step takes four taps toward the sun and three scattering octaves, so interiors show soft light gradients and backlit edges get silver linings. A fibrous altostratus deck above is still a thin 2D layer.
 
-Cloud noise octaves are filtered by pixel footprint, and silhouettes are anti-aliased analytically: the screen-space derivative of each layer's edge function sets the width of its opacity edge. Cloud transmittance along the sun direction dims the sunlight that reaches the water, and aerial perspective is applied over the sea.
+The deck's noise octaves are filtered by pixel footprint, and its silhouettes are anti-aliased analytically: the screen-space derivative of its edge function sets the width of its opacity edge. The march starts at a random offset per pixel to hide step banding. Cloud transmittance along the sun direction dims the sunlight that reaches the water, and aerial perspective is applied over the sea.
 
 ### Post-processing
 
-The scene renders in HDR with 4x MSAA. Post-processing adds an 8-level bloom, AgX tone mapping, a slight white balance shift, and dithering.
+The scene renders in HDR with 4x MSAA. Post-processing adds an 8-level bloom, AgX tone mapping, a slight white balance shift, and dithering. Sun shafts come from the composite pass: it marches toward the sun and measures how much of the line is clear sky (the sky pass writes cloud transmittance to alpha and the sea writes -1), so gaps in the clouds stream light and clouds cast dark shafts.
 
 ## Performance
 
-At 2560 by 1440 on an RTX 5070 Ti, the GPU takes about 6 to 8 ms per frame, measured while other programs were also using the GPU. The HUD shows FPS and GPU time when the browser supports `timestamp-query`.
+At 2560 by 1440 on an RTX 4070 Ti, the GPU takes about 2 to 3 ms per frame. The ocean is drawn in two passes, depth first, so its full shader runs only once per pixel. The HUD shows FPS and GPU time when the browser supports `timestamp-query`.
 
 The per-frame code reuses preallocated typed arrays and descriptors, so the garbage collector has almost nothing to do. The only recurring allocations are the objects WebGPU itself requires, such as the swap-chain view and command buffers.
 

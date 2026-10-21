@@ -1,5 +1,5 @@
 // Ocean surface + sky background rendering.
-import { FRAME_WGSL, ATMO_CORE_WGSL, ENV_MIPS, ENV_SIZE, N, CASCADES } from './common.js';
+import { FRAME_WGSL, ATMO_CORE_WGSL, LIGHT_WGSL, ENV_MIPS, ENV_SIZE, N, CASCADES } from './common.js';
 import { SKY_RENDER_FUNCS, SKY_CLOUD_FUNCS } from './sky.js';
 
 const RENDER_BINDINGS = /* wgsl */ `
@@ -26,20 +26,24 @@ struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
   var d2 = dir;
   d2.y = max(d2.y, 0.0005);
   d2 = normalize(d2);
-  // edge functions at this pixel (uniform control flow, so fwidth is valid)
-  let hl = hitLayer(d2, F.cloudP.x);
-  let el = lowEdge(hl.q, hl.t * pixAng / hl.mu, 7);
+  // high-deck edge function at this pixel (uniform control flow, so fwidth is valid)
   let hh = hitLayer(d2, 4.5);
   let eh = highEdge(hh.q, hh.t * pixAng / hh.mu, 6);
-  let aa = vec2f(fwidth(el), fwidth(eh));
+  // per-pixel random start of the cloud march hides step banding
+  let jit = f32(pcgHash(u32(in.pos.x) * 1973u + pcgHash(u32(in.pos.y)))) / 4294967296.0;
   var sunT = 1.0;
-  let cl = cloudLayers(d2, pixAng, aa, &sunT);
+  let cl = cloudLayers(d2, pixAng, fwidth(eh), 56, jit, &sunT);
   let L = skyAtmo(d2) * (1.0 - cl.a) + cl.rgb + sunDisk(dir) * sunT;
-  return vec4f(L, 1.0);
+  // alpha = sunlight getting through the clouds (the sea writes -1): mask for the sun shafts
+  return vec4f(L, sunT);
 }
 `;
 
-export const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ `
+// The surface is drawn twice: a depth-only pass (fsDepth) and then the shading pass with
+// depthCompare 'equal', so the expensive fragment shader runs only for the front-most surface
+// instead of for every wave face hidden behind a nearer crest. @invariant keeps the depth of
+// both passes identical.
+export const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + LIGHT_WGSL + RENDER_BINDINGS + /* wgsl */ `
 @group(0) @binding(4) var dispTex: texture_2d_array<f32>;
 @group(0) @binding(5) var derivTex: texture_2d_array<f32>;
 @group(0) @binding(6) var momTex: texture_2d_array<f32>;
@@ -47,14 +51,14 @@ export const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ 
 @group(0) @binding(8) var envCube: texture_cube<f32>;
 @group(0) @binding(9) var sampR: sampler;
 @group(0) @binding(10) var foamWorld: texture_2d_array<f32>;
-@group(0) @binding(11) var<storage, read> sunVis: array<f32, 4>;
+@group(0) @binding(11) var<storage, read> light: Light;
 ` + SKY_RENDER_FUNCS + /* wgsl */ `
 const ENV_MAXMIP: f32 = ${ENV_MIPS - 1}.0;
 const ENV_TEXELS_PER_RAD: f32 = ${ENV_SIZE}.0 / 1.5708;
 const TEX_N: f32 = ${N}.0;
 
 struct VSOut {
-  @builtin(position) pos: vec4f,
+  @builtin(position) @invariant pos: vec4f,
   @location(0) rel: vec3f,     // displaced position relative to the camera
   @location(1) xz: vec2f,      // undisplaced (lagrangian) coordinates
   @location(2) height: f32,
@@ -106,6 +110,16 @@ fn lambdaSmith(w: vec3f, cov: vec3f) -> f32 {
   return (1.0 - 1.259 * a + 0.396 * a * a) / (3.535 * a + 2.181 * a * a);
 }
 
+// true when the condition holds anywhere in this pixel's 2x2 quad (helper lanes included);
+// built from fine derivatives, so it must be called in uniform control flow
+fn quadAny(c: bool) -> bool {
+  let v = select(0.0, 1.0, c);
+  let h = v + abs(dpdxFine(v));
+  return h + abs(dpdyFine(h)) > 0.0;
+}
+
+// only called from a quad-uniform branch (see quadAny), where implicit derivatives are valid
+@diagnostic(off, derivative_uniformity)
 fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let a = textureSample(foamTex, sampR, xz * 0.23 + vec2f(0.013, 0.0) * t).r;
   let b = textureSample(foamTex, sampR, xz * 0.71 + vec2f(0.37, 0.71)).g;
@@ -126,12 +140,13 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
     let uv = xz * F.cascInvL[c >> 2u][c & 3u];
     let gk = mix(1.0, gust, select(0.0, select(0.5, 1.0, c >= 4u), c >= 3u));
     let dv = textureSample(derivTex, sampR, uv, c) * gk;
-    let mv = textureSample(momTex, sampR, uv, c) * (gk * gk);
-    let av = textureSample(dispTex, sampR, uv, c) * gk;
+    // momTex.w carries the jxz Jacobian term (also in dispTex.w), saving a fetch per cascade
+    let m = textureSample(momTex, sampR, uv, c);
+    let mv = m * (gk * gk);
     s += dv.xy;
     jxx += dv.z;
     jzz += dv.w;
-    jxz += av.w;
+    jxz += m.w * gk;
     cov += vec3f(max(mv.x - dv.x * dv.x, 0.0), max(mv.y - dv.y * dv.y, 0.0), mv.z - dv.x * dv.y);
   }
   let dist = length(in.rel);
@@ -154,14 +169,10 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   cov += aa * min(1.0, 0.03 / max(max(aa.x, aa.y), 1e-8));
   let J = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
 
-  let sunE = sunIlluminance() * sunVis[0];
-  let skyUp = textureSampleLevel(envCube, sampC, vec3f(0.0, 1.0, 0.0), ENV_MAXMIP).rgb;
-  // average radiance of the whole upper hemisphere (incl. the bright horizon band)
-  let skyHemi = skyUp * 0.4 + 0.15 * (
-      textureSampleLevel(envCube, sampC, vec3f(0.94, 0.34, 0.0), ENV_MAXMIP - 1.0).rgb +
-      textureSampleLevel(envCube, sampC, vec3f(-0.94, 0.34, 0.0), ENV_MAXMIP - 1.0).rgb +
-      textureSampleLevel(envCube, sampC, vec3f(0.0, 0.34, 0.94), ENV_MAXMIP - 1.0).rgb +
-      textureSampleLevel(envCube, sampC, vec3f(0.0, 0.34, -0.94), ENV_MAXMIP - 1.0).rgb);
+  // frame constants (see SUN_VIS): sun illuminance, zenith sky, upper-hemisphere average
+  let sunE = light.sunE.rgb;
+  let skyUp = light.skyUp.rgb;
+  let skyHemi = light.skyHemi.rgb;
   let skyN = textureSampleLevel(envCube, sampC, nrm, ENV_MAXMIP - 1.0).rgb;
 
   // ---- sun glitter: anisotropic Gaussian slope distribution ----
@@ -216,38 +227,53 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let cheb = max(dc.x, dc.y);
   let w0 = 1.0 - smoothstep(0.30 * F.lodP.z, 0.45 * F.lodP.z, cheb);
   let w1 = 1.0 - smoothstep(0.30 * F.lodP.w, 0.45 * F.lodP.w, cheb);
-  let fw0 = textureSample(foamWorld, sampR, xz / F.lodP.z, 0u);
-  let fw1 = textureSample(foamWorld, sampR, xz / F.lodP.w, 1u);
+  // Texture work that cannot change this pixel is skipped, but only for whole 2x2 quads
+  // (quadAny), so the implicit derivatives of every fetch that does run are unchanged. A
+  // clipmap level with weight 0 contributes exactly 0, as does the foam pattern where there
+  // is no cover and no fresh crest foam, so the result is the same as always fetching.
+  let dbg = F.post.w > 0.5;
+  var fw0 = vec4f(0.0);
+  var fw1 = vec4f(0.0);
+  @diagnostic(off, derivative_uniformity) if (quadAny(w0 > 0.0 || dbg)) {
+    fw0 = textureSample(foamWorld, sampR, xz / F.lodP.z, 0u);
+  }
+  @diagnostic(off, derivative_uniformity) if (quadAny(w1 > 0.0 || dbg)) {
+    fw1 = textureSample(foamWorld, sampR, xz / F.lodP.w, 1u);
+  }
   let fwl = mix(fw1, fw0, w0) * w1;
   let fresh = clamp((F.foamP.x - J) * F.foamP.y, 0.0, 1.0);
   var cover = clamp((max(fwl.r, fresh * (1.0 - w1 * 0.7)) + fwl.g * 0.6) * F.foamP.z, 0.0, 1.5);
-  // aged foam breaks into wind-aligned streaks; fresh crest foam stays dense
-  let wd = F.windP[0].xy;
-  let ws = vec2f(dot(xz, wd), dot(xz, vec2f(-wd.y, wd.x)));
-  let streak = textureSample(foamTex, sampR, ws * vec2f(0.035, 0.11)).a;
-  let freshK = clamp(fwl.g * 2.0 + fresh, 0.0, 1.0);
-  cover *= mix(smoothstep(0.25, 0.75, streak) * 1.5, 1.0, freshK);
-  let pat = foamPattern(xz, F.camPos.w);
-  let fw = fwidth(pat) + 0.03;
-  // soft threshold: thin foam is a translucent film, dense foam is opaque white
-  // dense foam has crisp edges, thin decaying foam a soft translucent margin
-  let soft = 0.04 + 0.14 * (1.0 - clamp(cover, 0.0, 1.0));
-  let fm = smoothstep(1.0 - cover - fw - soft, 1.0 - cover + fw + soft, pat);
-  var foamMask = clamp(fm * smoothstep(0.0, 0.5, cover), 0.0, 1.0) * (0.68 + 0.32 * smoothstep(0.3, 0.9, cover));
-  // freshly broken crests: dense, almost opaque core
-  foamMask = max(foamMask, smoothstep(0.35, 0.9, fwl.g) * smoothstep(0.25, 0.6, pat + 0.25) * 0.95);
+  var foamMask = 0.0;
+  var foamLit = vec3f(0.0);
+  @diagnostic(off, derivative_uniformity) if (quadAny(cover > 0.0 || fwl.g > 0.35 || dbg)) {
+    // aged foam breaks into wind-aligned streaks; fresh crest foam stays dense
+    let wd = F.windP[0].xy;
+    let ws = vec2f(dot(xz, wd), dot(xz, vec2f(-wd.y, wd.x)));
+    let streak = textureSample(foamTex, sampR, ws * vec2f(0.035, 0.11)).a;
+    let freshK = clamp(fwl.g * 2.0 + fresh, 0.0, 1.0);
+    cover *= mix(smoothstep(0.25, 0.75, streak) * 1.5, 1.0, freshK);
+    let pat = foamPattern(xz, F.camPos.w);
+    let fw = fwidth(pat) + 0.03;
+    // soft threshold: thin foam is a translucent film, dense foam is opaque white
+    // dense foam has crisp edges, thin decaying foam a soft translucent margin
+    let soft = 0.04 + 0.14 * (1.0 - clamp(cover, 0.0, 1.0));
+    let fm = smoothstep(1.0 - cover - fw - soft, 1.0 - cover + fw + soft, pat);
+    foamMask = clamp(fm * smoothstep(0.0, 0.5, cover), 0.0, 1.0) * (0.68 + 0.32 * smoothstep(0.3, 0.9, cover));
+    // freshly broken crests: dense, almost opaque core
+    foamMask = max(foamMask, smoothstep(0.35, 0.9, fwl.g) * smoothstep(0.25, 0.6, pat + 0.25) * 0.95);
+    // bubbly brightness variation inside the foam
+    let bub = textureSample(foamTex, sampR, xz * 1.9 + vec2f(0.21, 0.53)).g;
+    let foamAlb = vec3f(0.82, 0.87, 0.92) * (0.78 + 0.3 * bub);
+    // diffuse: albedo * (sky irradiance / pi + sun * cos / pi); sky dominates at sunset
+    // foam scatters light from the whole hemisphere (incl. the cool zenith): use a less saturated ambient
+    let foamAmb = skyHemi * 1.0 + skyN * 0.3;
+    let foamAmbN = mix(foamAmb, vec3f(dot(foamAmb, vec3f(0.2126, 0.7152, 0.0722))), 0.85);
+    // grazing sun is largely self-shadowed by the foam's lumpy micro-structure
+    foamLit = foamAlb * (sunE * max(dot(nrm, Ld), 0.0) * 0.318 * 0.5 + foamAmbN * 1.55);
+  }
   // submerged bubbles brighten and tint the water just beneath foam
   body += F.sssCol.rgb * (sunE * 0.05 + ambient * 0.35) * clamp(cover, 0.0, 1.0);
   body += vec3f(0.10, 0.32, 0.30) * skyUp * fwl.g * 0.35;
-  // bubbly brightness variation inside the foam
-  let bub = textureSample(foamTex, sampR, xz * 1.9 + vec2f(0.21, 0.53)).g;
-  let foamAlb = vec3f(0.82, 0.87, 0.92) * (0.78 + 0.3 * bub);
-  // diffuse: albedo * (sky irradiance / pi + sun * cos / pi); sky dominates at sunset
-  // foam scatters light from the whole hemisphere (incl. the cool zenith): use a less saturated ambient
-  let foamAmb = skyHemi * 1.0 + skyN * 0.3;
-  let foamAmbN = mix(foamAmb, vec3f(dot(foamAmb, vec3f(0.2126, 0.7152, 0.0722))), 0.85);
-  // grazing sun is largely self-shadowed by the foam's lumpy micro-structure
-  let foamLit = foamAlb * (sunE * max(dot(nrm, Ld), 0.0) * 0.318 * 0.5 + foamAmbN * 1.55);
 
   if (F.post.w > 0.5) {
     // debug: r = foam cover, g = clamp(J), b = world foam level-0 weight
@@ -268,8 +294,11 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let hz = normalize(vec3f(-V.x, 0.002, -V.z));
   let fogCol = skyAtmo(hz);
   col = col * T + fogCol * (1.0 - T);
-  return vec4f(col, 1.0);
+  return vec4f(col, -1.0);  // alpha -1 marks the sea for the sun-shaft pass
 }
+
+// depth pre-pass: no colour output (the pipeline's colour writeMask is 0)
+@fragment fn fsDepth() {}
 `;
 
 // Samples the displaced surface height under the camera (inverting the horizontal

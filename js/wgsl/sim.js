@@ -230,7 +230,8 @@ fn emit(x: u32, y: u32, c: u32, a: vec4f, b: vec4f) {
   let p = vec2u(x, y);
   textureStore(dispOut, p, c, vec4f(a.x, a.z, a.y, a.w));
   textureStore(derivOut, p, c, b);
-  textureStore(momOut, p, c, vec4f(b.x * b.x, b.y * b.y, b.x * b.y, 0.0));
+  // slope moments plus a copy of jxz, so the ocean shader needs no dispTex fetch
+  textureStore(momOut, p, c, vec4f(b.x * b.x, b.y * b.y, b.x * b.y, a.w));
 }
 
 @compute @workgroup_size(${N / 2})
