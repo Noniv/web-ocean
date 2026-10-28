@@ -1,0 +1,17 @@
+{
+  "name": "web-solar",
+  "version": "1.0.0",
+  "description": "Real-time WebGPU solar system: prefiltered ring system, LEAN-mapped planet surfaces, physically based atmospheres.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "build": "node build.mjs",
+    "lint": "node lint.mjs",
+    "check": "node lint.mjs && node check.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
